@@ -2786,7 +2786,13 @@ def main():
 
 
     import requests
-    BOT_TOKEN = "8441264024:AAEWwHrRX0jktIuWnH4Z9qXv8GzJ-JIlkB0"  # 換成你的
+    import os
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        print("請設置環境變量 TELEGRAM_BOT_TOKEN")
+        return
+
+    BOT_TOKEN = token
 
     CHAT_ID   = "6166024220"
 
