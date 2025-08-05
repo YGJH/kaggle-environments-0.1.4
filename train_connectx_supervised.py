@@ -235,8 +235,8 @@ class PPOAgent:
             # 返回默認值
             return [0] * 42, player_idx + 1
 
-    def encode_state(self, board, mark):
-        """編碼棋盤狀態"""
+    def encode_state(self, board, mark, use_compact=False):
+        """編碼棋盤狀態 - 支援緊湊模式"""
         # 確保 board 是有效的
         if not board:
             board = [0] * 42
@@ -247,25 +247,38 @@ class PPOAgent:
             else:
                 board = list(board)[:42]
 
-        # 轉換為 6x7 矩陣
-        state = np.array(board).reshape(6, 7)
+        if use_compact:
+            # 緊湊編碼：42維，從當前玩家視角
+            # 值: -1=對手棋子, 0=空位, 1=自己棋子
+            encoded = np.array(board, dtype=np.float32)
+            # 將對手標記轉換為-1，自己標記轉換為1
+            opponent_mark = 3 - mark
+            encoded[encoded == mark] = 1.0
+            encoded[encoded == opponent_mark] = -1.0
+            # 空位保持0
+            encoded[encoded == 0] = 0.0
+            return encoded
+        else:
+            # 原始多通道編碼：126維
+            # 轉換為 6x7 矩陣
+            state = np.array(board).reshape(6, 7)
 
-        # 創建三個特徵通道
-        # 通道 1: 當前玩家的棋子
-        player_pieces = (state == mark).astype(np.float32)
-        # 通道 2: 對手的棋子
-        opponent_pieces = (state == (3 - mark)).astype(np.float32)
-        # 通道 3: 空位
-        empty_spaces = (state == 0).astype(np.float32)
+            # 創建三個特徵通道
+            # 通道 1: 當前玩家的棋子
+            player_pieces = (state == mark).astype(np.float32)
+            # 通道 2: 對手的棋子
+            opponent_pieces = (state == (3 - mark)).astype(np.float32)
+            # 通道 3: 空位
+            empty_spaces = (state == 0).astype(np.float32)
 
-        # 拉平並連接
-        encoded = np.concatenate([
-            player_pieces.flatten(),
-            opponent_pieces.flatten(),
-            empty_spaces.flatten()
-        ])
+            # 拉平並連接
+            encoded = np.concatenate([
+                player_pieces.flatten(),
+                opponent_pieces.flatten(),
+                empty_spaces.flatten()
+            ])
 
-        return encoded
+            return encoded
 
     def get_valid_actions(self, board):
         """獲取有效動作"""
@@ -482,6 +495,9 @@ class ConnectXTrainer:
 
     def encode_state(self, board, mark):
         """編碼棋盤狀態"""
+        # 使用配置中的編碼模式
+        use_compact = self.config['training'].get('use_compact_encoding', False)
+        
         # 確保 board 是有效的
         if not board:
             board = [0] * 42
@@ -491,25 +507,38 @@ class ConnectXTrainer:
             else:
                 board = list(board)[:42]
 
-        # 轉換為 6x7 矩陣
-        state = np.array(board).reshape(6, 7)
+        if use_compact:
+            # 緊湊編碼：42維，從當前玩家視角
+            # 值: -1=對手棋子, 0=空位, 1=自己棋子
+            encoded = np.array(board, dtype=np.float32)
+            # 將對手標記轉換為-1，自己標記轉換為1
+            opponent_mark = 3 - mark
+            encoded[encoded == mark] = 1.0
+            encoded[encoded == opponent_mark] = -1.0
+            # 空位保持0
+            encoded[encoded == 0] = 0.0
+            return encoded
+        else:
+            # 原始多通道編碼：126維
+            # 轉換為 6x7 矩陣
+            state = np.array(board).reshape(6, 7)
 
-        # 創建三個特徵通道
-        # 通道 1: 當前玩家的棋子
-        player_pieces = (state == mark).astype(np.float32)
-        # 通道 2: 對手的棋子
-        opponent_pieces = (state == (3 - mark)).astype(np.float32)
-        # 通道 3: 空位
-        empty_spaces = (state == 0).astype(np.float32)
+            # 創建三個特徵通道
+            # 通道 1: 當前玩家的棋子
+            player_pieces = (state == mark).astype(np.float32)
+            # 通道 2: 對手的棋子
+            opponent_pieces = (state == (3 - mark)).astype(np.float32)
+            # 通道 3: 空位
+            empty_spaces = (state == 0).astype(np.float32)
 
-        # 拉平並連接
-        encoded = np.concatenate([
-            player_pieces.flatten(),
-            opponent_pieces.flatten(),
-            empty_spaces.flatten()
-        ])
+            # 拉平並連接
+            encoded = np.concatenate([
+                player_pieces.flatten(),
+                opponent_pieces.flatten(),
+                empty_spaces.flatten()
+            ])
 
-        return encoded
+            return encoded
 
     def load_dataset(self, file_path="connectx-state-action-value.txt", max_lines=10000):
         """載入訓練數據集 - 記憶體優化版本"""
@@ -565,9 +594,13 @@ class ConnectXTrainer:
                 logger.error("沒有找到任何有效樣本！")
                 return None, None
 
-            # 預分配記憶體
-            states = np.zeros((valid_samples, 126), dtype=np.float32)
+            # 預分配記憶體 - 根據編碼模式調整
+            input_size = self.config['agent']['input_size']
+            states = np.zeros((valid_samples, input_size), dtype=np.float32)
             action_values = np.zeros((valid_samples, 7), dtype=np.float32)
+            
+            logger.info(f"💾 預分配記憶體: {states.nbytes / 1024 / 1024:.1f} MB (狀態) + {action_values.nbytes / 1024 / 1024:.1f} MB (動作值)")
+            logger.info(f"📏 使用 {self.config['training'].get('encoding_info', '未知編碼模式')}")
             
             # 第二次掃描：載入數據
             logger.info("📥 第二次掃描：載入數據...")
@@ -1036,11 +1069,20 @@ class ConnectXTrainer:
 
         return win_rate
 
-def create_config():
+def create_config(use_compact_encoding=True):
     """創建訓練配置"""
+    
+    # 根據編碼模式選擇輸入大小
+    if use_compact_encoding:
+        input_size = 42      # 緊湊編碼：42維
+        encoding_info = "緊湊編碼 (42維, 3倍記憶體節省)"
+    else:
+        input_size = 126     # 多通道編碼：126維  
+        encoding_info = "多通道編碼 (126維, 更好特徵分離)"
+    
     config = {
         'agent': {
-            'input_size': 126,      # 3個通道 × 42個位置
+            'input_size': input_size,
             'hidden_size': 150,     # 隱藏層大小
             'num_layers': 3,        # 隱藏層數量（修正為合理值）
             'learning_rate': 0.001, # 學習率
@@ -1051,7 +1093,9 @@ def create_config():
             'batch_size': 128,      # 批次大小
             'max_lines': 50000,     # 最大數據集行數
             'eval_games': 100,      # 評估遊戲數量
-            'memory_efficient': True # 是否使用記憶體優化模式
+            'memory_efficient': True, # 是否使用記憶體優化模式
+            'use_compact_encoding': use_compact_encoding,  # 是否使用緊湊編碼
+            'encoding_info': encoding_info
         }
     }
     return config
@@ -1085,11 +1129,24 @@ def main():
 
         # 顯示配置
         print("\n📋 訓練配置:")
+        print(f"   輸入維度: {config['agent']['input_size']} ({config['training']['encoding_info']})")
         print(f"   網絡結構: {config['agent']['hidden_size']} 隱藏單元, {config['agent']['num_layers']} 層")
         print(f"   學習率: {config['agent']['learning_rate']}")
         print(f"   訓練epochs: {config['training']['epochs']}")
         print(f"   批次大小: {config['training']['batch_size']}")
         print(f"   最大數據集行數: {config['training']['max_lines']}")
+        print(f"   記憶體優化: {'啟用' if config['training']['memory_efficient'] else '停用'}")
+
+        # 估算記憶體使用
+        estimated_samples = config['training']['max_lines']
+        input_size = config['agent']['input_size']
+        estimated_memory = (estimated_samples * input_size * 4) / 1024 / 1024  # MB
+        print(f"   預估記憶體: {estimated_memory:.1f} MB (狀態數據)")
+        
+        if estimated_memory > 1000:  # 大於1GB
+            print(f"   ⚠️  記憶體使用量較大，建議使用分批模式")
+        else:
+            print(f"   ✅ 記憶體使用量合理")
 
         # 開始訓練
         print("\n🚀 開始監督學習訓練...")
