@@ -35,7 +35,7 @@ connectx-rl-training/
 sub/
 logs/
 kaggle_environments/
-
+submission*.py
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
