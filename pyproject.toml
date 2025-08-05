@@ -1,0 +1,31 @@
+[project]
+name = "kaggle-environments-0-1-4"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "gym>=0.26.2",
+    "jsonschema>=4.25.0",
+    "numpy>=2.3.2",
+    "scipy>=1.16.1",
+    "setuptools>=80.9.0",
+    "torch>=2.7.1",
+    "PyYAML>=6.0",
+    "tqdm>=4.60.0",
+    "matplotlib>=3.5.0",
+    "tensorboard>=2.8.0",
+    "flask>=3.1.1",
+    "requests>=2.32.4",
+    "chessnut>=0.4.1",
+    "pandas>=2.3.1",
+    "pettingzoo>=1.25.0",
+    "transformers>=4.54.1",
+    "open-spiel>=1.6",
+    "pygame>=2.6.1",
+    "termcolor>=3.1.0",
+    "ipython>=9.4.0",
+    "kaggle-environments==0.1.4",
+    "pyqt5>=5.15.11",
+    "psutil>=7.0.0",
+]
