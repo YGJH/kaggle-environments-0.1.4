@@ -149,3 +149,5 @@ early_stopping_patience: 5000
 增加 buffer_size 到 10000
 調整 gamma 到 0.98
 這些參數經過精心調優，形成了一個平衡的訓練系統，能夠穩定地將AI訓練到94%的勝率水平！🏆
+ ERROR - 訓練回合 90801 時出錯: setting an array element with a sequence. The requested array has an inhomogeneous shape after 1 dimensions. The detected shape was (2,) + inhomogeneous part.
+ERROR - 訓練回合 90807 時出錯: setting an array element with a sequence. The requested array has an inhomogeneous shape after 1 dimensions. The detected shape was (2,) + inhomogeneous part.

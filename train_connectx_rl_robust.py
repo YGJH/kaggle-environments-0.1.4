@@ -26,12 +26,22 @@ try:
     import matplotlib.patches as patches
     from matplotlib.animation import FuncAnimation
     import matplotlib.colors as mcolors
+    
+    # 配置中文字体支持
+    plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'Liberation Sans', 'Bitstream Vera Sans']
+    plt.rcParams['axes.unicode_minus'] = False
+    # 设置字体大小，避免中文显示问题
+    plt.rcParams['font.size'] = 10
+    plt.rcParams['axes.labelsize'] = 10
+    plt.rcParams['xtick.labelsize'] = 9
+    plt.rcParams['ytick.labelsize'] = 9
+    
     VISUALIZATION_AVAILABLE = True
 except ImportError:
     print("Matplotlib not found. Installing for visualization...")
     try:
         import subprocess
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "matplotlib"])
+        subprocess.check_call(["uv", "add","matplotlib"])
         import matplotlib.pyplot as plt
         import matplotlib.patches as patches
         from matplotlib.animation import FuncAnimation
@@ -256,17 +266,26 @@ class PPOAgent:
     def encode_state(self, board, mark):
         """編碼棋盤狀態"""
         # 確保 board 是有效的
-        if not board:
+        if board is None or (isinstance(board, (list, np.ndarray)) and len(board) == 0):
             board = [0] * 42
-        elif len(board) != 42:
-            # 如果長度不對，調整或填充
-            if len(board) < 42:
-                board = list(board) + [0] * (42 - len(board))
-            else:
-                board = list(board)[:42]
+        else:
+            # 處理嵌套列表或確保是一維列表
+            if isinstance(board, np.ndarray):
+                board = board.flatten().tolist()
+            elif isinstance(board, list) and len(board) > 0:
+                # 檢查是否為嵌套列表
+                if isinstance(board[0], (list, np.ndarray)):
+                    board = [item for sublist in board for item in sublist]
+                    
+            # 確保長度為 42
+            if len(board) != 42:
+                if len(board) < 42:
+                    board = list(board) + [0] * (42 - len(board))
+                else:
+                    board = list(board)[:42]
 
         # 轉換為 6x7 矩陣
-        state = np.array(board).reshape(6, 7)
+        state = np.array(board, dtype=np.int32).reshape(6, 7)
 
         # 創建三個特徵通道
         # 通道 1: 當前玩家的棋子
@@ -482,6 +501,15 @@ class ConnectXTrainer:
         self.episode_rewards = []
         self.win_rates = []
         self.training_losses = []
+        
+        # 新增：歷史模型保存（用於課程化學習）
+        self.historical_models = []
+        self.model_save_frequency = 1000  # 每1000回合保存一個歷史模型
+        
+        # 探索增強參數
+        self.exploration_decay = 0.995
+        self.min_exploration = 0.1
+        self.current_exploration = 1.0
 
         # 持續學習數據
         self.continuous_learning_data = None
@@ -1251,11 +1279,22 @@ class ConnectXTrainer:
             return True
         return False
 
-    def play_game(self, agent1_func, agent2_func, training=True):
-        """進行一場遊戲"""
+    def play_game(self, agent1_func, agent2_func, training=True, training_player=None):
+        """進行一場遊戲
+        
+        Args:
+            agent1_func: 玩家1的智能體函數
+            agent2_func: 玩家2的智能體函數  
+            training: 是否為訓練模式
+            training_player: 指定哪個玩家進行訓練 (1 或 2)，None表示隨機選擇
+        """
         env = make("connectx", debug=False)
         env.reset()
 
+        # 隨機決定哪個玩家進行訓練（收集經驗）
+        if training_player is None:
+            training_player = np.random.choice([1, 2])  # 隨機選擇先手或後手進行訓練
+        
         episode_transitions = []
         move_count = 0
         max_moves = 50  # 防止無限循環
@@ -1279,21 +1318,32 @@ class ConnectXTrainer:
                     else:
                         result = agent2_func(state, valid_actions, training)
 
-                    # 處理不同的返回格式
-                    if len(result) == 4:  # 包含危險標記的新格式
-                        action, prob, value, is_dangerous = result
-                    else:  # 傳統格式
+                    # 處理統一的返回格式 - 所有agent函數都返回3個值 (action, prob, value)
+                    try:
                         action, prob, value = result
+                        is_dangerous = False  # 危險檢測已經整合到agent內部邏輯中
+                    except ValueError as e:
+                        logger.warning(f"Agent返回值格式錯誤: {result}, 錯誤: {e}")
+                        # 提供默認值
+                        if isinstance(result, (list, tuple)) and len(result) > 0:
+                            action = int(result[0]) if len(result) > 0 else np.random.choice(valid_actions)
+                            prob = float(result[1]) if len(result) > 1 else 0.0
+                            value = float(result[2]) if len(result) > 2 else 0.0
+                        else:
+                            action = np.random.choice(valid_actions)
+                            prob = 0.0
+                            value = 0.0
                         is_dangerous = False
 
-                    # 只為玩家1儲存轉換
-                    if training and current_player == 1:
+                    # 只為指定的訓練玩家儲存轉換
+                    if training and current_player == training_player:
                         episode_transitions.append({
                             'state': state,
                             'action': action,
                             'prob': prob,
                             'value': value,
-                            'is_dangerous': is_dangerous
+                            'is_dangerous': is_dangerous,
+                            'training_player': training_player  # 記錄訓練玩家
                         })
 
                     actions.append(action)
@@ -1313,31 +1363,40 @@ class ConnectXTrainer:
         if training and episode_transitions:
             reward = 0
             game_length = len(episode_transitions)
+            
+            # 獲取訓練玩家編號
+            training_player_id = episode_transitions[0].get('training_player', 1)
 
             try:
-                if env.state[0]['status'] == 'DONE':
-                    if env.state[0]['reward'] == 1:  # 玩家1獲勝
+                # 根據訓練玩家的結果計算獎勵
+                if training_player_id == 1:
+                    player_result = env.state[0]['reward']
+                else:  # training_player_id == 2
+                    player_result = env.state[1]['reward']
+                
+                if env.state[0]['status'] == 'DONE' or env.state[1]['status'] == 'DONE':
+                    if player_result == 1:  # 訓練玩家獲勝
                         # 快速獲勝給予更高獎勵，長遊戲獲勝獎勵較低
                         if game_length <= 7:
-                            reward = 2  # 快速獲勝
+                            reward = 200  # 快速獲勝
                         elif game_length <= 15:
-                            reward = 15  # 正常獲勝
+                            reward = 150  # 正常獲勝
                         else:
-                            reward = 20  # 長遊戲獲勝
-                    elif env.state[0]['reward'] == -1:  # 玩家1失敗
+                            reward = 100  # 長遊戲獲勝
+                    elif player_result == -1:  # 訓練玩家失敗
                         # 快速失敗懲罰更重
                         if game_length <= 7:
                             reward = -150  # 快速失敗
                         elif game_length <= 15:
                             reward = -100  # 正常失敗
                         else:
-                            reward = -80   # 長遊戲失敗（至少撐得久）
+                            reward = -50   # 長遊戲失敗（至少堅持了很久）
                     else:  # 平局
-                        # 平局根據遊戲長度給不同獎勵
-                        if game_length >= 20:
-                            reward = 5   # 長遊戲平局是好的
+                        # 平局獎勵根據遊戲長度調整
+                        if game_length >= 30:
+                            reward = 50   # 長遊戲平局是好事
                         else:
-                            reward = -10  # 短遊戲平局可能是策略問題
+                            reward = 20   # 短遊戲平局還可以
             except KeyError:
                 reward = -5  # 異常情況給小懲罰
 
@@ -1366,6 +1425,149 @@ class ConnectXTrainer:
                     transition['prob'],
                     shaped_reward,
                     i == len(episode_transitions) - 1  # done 標誌
+                )
+
+        try:
+            final_reward = env.state[0]['reward']
+        except (KeyError, IndexError):
+            final_reward = 0
+
+        return final_reward, len(episode_transitions)
+
+    def play_game_with_different_agents(self, agent1_func, agent2_func, training=True, training_player=None):
+        """進行一場遊戲，支持不同的智能體函數（用於改進的自對弈）
+        
+        Args:
+            agent1_func: 玩家1的智能體函數
+            agent2_func: 玩家2的智能體函數（
+            training: 是否為訓練模式
+            training_player: 指定哪個玩家進行訓練 (1 或 2)，None表示隨機選擇
+        """
+        env = make("connectx", debug=False)
+        env.reset()
+
+        # 隨機決定哪個玩家進行訓練（收集經驗）
+        if training_player is None:
+            training_player = np.random.choice([1, 2])  # 隨機選擇先手或後手進行訓練
+
+        episode_transitions = []
+        move_count = 0
+        max_moves = 50  # 防止無限循環
+
+        while not env.done and move_count < max_moves:
+            # 為兩個玩家獲取動作
+            actions = []
+
+            for player_idx in range(2):
+                if env.state[player_idx]['status'] == 'ACTIVE':
+                    # 使用新的提取方法
+                    board, current_player = self.agent.extract_board_and_mark(env.state, player_idx)
+
+                    # 編碼狀態
+                    state = self.agent.encode_state(board, current_player)
+                    valid_actions = self.agent.get_valid_actions(board)
+
+                    # 根據玩家選擇對應的智能體函數
+                    if current_player == 1:
+                        result = agent1_func(state, valid_actions, training)
+                    else:
+                        result = agent2_func(state, valid_actions, training)
+
+                    # 處理不同的返回格式
+                    if len(result) == 4:  # 包含危險標記的新格式
+                        action, prob, value, is_dangerous = result
+                    else:  # 傳統格式
+                        action, prob, value = result
+                        is_dangerous = False
+
+                    # 只為指定的訓練玩家儲存轉換
+                    if training and current_player == training_player:
+                        episode_transitions.append({
+                            'state': state,
+                            'action': action,
+                            'prob': prob,
+                            'value': value,
+                            'is_dangerous': is_dangerous,
+                            'training_player': training_player  # 記錄訓練玩家
+                        })
+
+                    actions.append(action)
+                else:
+                    # 非活躍玩家 - 使用虛擬動作
+                    actions.append(0)
+
+            # 執行動作
+            try:
+                env.step(actions)
+                move_count += 1
+            except Exception as e:
+                logger.error(f"執行動作時出錯: {e}")
+                break
+
+        # 計算獎勵（與原play_game方法相同的邏輯）
+        if training and episode_transitions:
+            reward = 0
+            game_length = len(episode_transitions)
+            
+            # 獲取訓練玩家編號
+            training_player_id = episode_transitions[0].get('training_player', 1)
+
+            try:
+                # 根據訓練玩家的結果計算獎勵
+                if training_player_id == 1:
+                    player_result = env.state[0]['reward']
+                else:  # training_player_id == 2
+                    player_result = env.state[1]['reward']
+                
+                if env.state[0]['status'] == 'DONE' or env.state[1]['status'] == 'DONE':
+                    if player_result == 1:  # 訓練玩家獲勝
+                        # 快速獲勝給予更高獎勵，長遊戲獲勝獎勵較低
+                        if game_length <= 7:
+                            reward = 10  # 快速獲勝
+                        elif game_length <= 15:
+                            reward = 10  # 正常獲勝
+                        else:
+                            reward = 10  # 長遊戲獲勝
+                    elif player_result == -1:  # 訓練玩家失敗
+                        # 快速失敗懲罰更重
+                        if game_length <= 7:
+                            reward = -150  # 快速失敗
+                        elif game_length <= 15:
+                            reward = -100  # 正常失敗
+                        else:
+                            reward = -50   # 長遊戲失敗（至少堅持了很久）
+                    else:  # 平局
+                        # 平局獎勵根據遊戲長度調整
+                        if game_length >= 30:
+                            reward = 50   # 長遊戲平局是好事
+                        else:
+                            reward = 20   # 短遊戲平局還可以
+            except KeyError:
+                reward = -5  # 異常情況給小懲罰
+
+            # 分配獎勵給轉換（加入位置獎勵和危險動作懲罰）
+            for i, transition in enumerate(episode_transitions):
+                # 基礎獎勵
+                shaped_reward = reward
+
+                # 危險動作懲罰
+                if transition.get('is_dangerous', False):
+                    shaped_reward -= 20  # 危險動作懲罰
+
+                # 時序獎勵：越靠近遊戲結尾的動作影響越大
+                position_weight = (i + 1) / game_length
+                shaped_reward = shaped_reward * (0.5 + 0.5 * position_weight)
+
+                # 添加小的探索獎勵（鼓勵嘗試不同策略）
+                exploration_bonus = 10 if i % 3 == 0 else 0
+                shaped_reward += exploration_bonus
+
+                self.agent.store_transition(
+                    transition['state'],
+                    transition['action'],
+                    transition['prob'],
+                    shaped_reward,
+                    i == len(episode_transitions) - 1
                 )
 
         try:
@@ -1438,12 +1640,41 @@ class ConnectXTrainer:
 
                 if self.is_dangerous_move(board, mark, action, look_ahead_steps=3):
                     logger.debug(f"自對弈中agent選擇了危險動作 {action} (策略: {strategy})")
-                    return int(action), prob, value, True  # 確保返回 Python int
 
-            return int(action), prob, value, False  # 確保返回 Python int
+            return int(action), prob, value  # 統一返回3個值
 
-        reward, episode_length = self.play_game(agent_func, agent_func, training=True)
-        logger.debug(f"自對弈完成，策略: {strategy}, 回合長度: {episode_length}")
+        reward, episode_length = self.play_game(agent_func, agent_func, training=True, training_player=None)
+        logger.debug(f"自對弈完成，策略: {strategy}, 回合長度: {episode_length}, 訓練玩家: 隨機選擇")
+        return reward, episode_length
+
+    def enhanced_self_play_episode(self):
+        """增強自對弈回合（使用戰術對手）"""
+        # 創建訓練中的智能體函數（與原來相同）
+        def training_agent_func(state, valid_actions, training):
+            action, prob, value = self.agent.select_action(state, valid_actions, training)
+            
+            if training:
+                # 檢查危險動作
+                board = state[:42].reshape(6, 7).astype(int)
+                mark = 1  # 玩家1
+                
+                if self.is_dangerous_move(board, mark, action, look_ahead_steps=3):
+                    logger.debug(f"訓練agent選擇了危險動作 {action}")
+            
+            return int(action), prob, value  # 統一返回3個值
+
+        # 創建戰術對手函數
+        tactical_opponent_func = self.create_tactical_opponent()
+
+        # 使用新的play_game_with_different_agents方法
+        reward, episode_length = self.play_game_with_different_agents(
+            training_agent_func, 
+            tactical_opponent_func, 
+            training=True,
+            training_player=None  # 隨機選擇訓練玩家
+        )
+        
+        logger.debug(f"增強自對弈完成，對手使用戰術函數，回合長度: {episode_length}")
         return reward, episode_length
 
     def adaptive_self_play_episode(self, episode_num):
@@ -1462,37 +1693,61 @@ class ConnectXTrainer:
         strategy = np.random.choice(['standard', 'noisy', 'exploration', 'temperature'], p=strategy_probs)
 
         def adaptive_agent_func(state, valid_actions, training):
-            action, prob, value = self.agent.select_action(state, valid_actions, training)
-
-            if training:
-                if strategy == 'noisy':
-                    noise_level = 0.2 * (1 - progress) + 0.05 * progress  # 隨進度降低噪音
-                    if np.random.random() < noise_level:
-                        action = int(np.random.choice(valid_actions))  # 確保返回 Python int
-
-                elif strategy == 'exploration':
-                    temperature = 1.8 - 0.6 * progress  # 溫度隨進度降低
-                    exploration_bonus = 0.15 * (1 - progress)  # 探索獎勵隨進度降低
-                    action, prob, value = self.agent.select_action(
-                        state, valid_actions, training, temperature=temperature, exploration_bonus=exploration_bonus)
-
-                elif strategy == 'temperature':
-                    # 溫度範圍隨進度收窄
-                    temp_range = (0.8 + 0.4 * progress, 2.0 - 0.5 * progress)
-                    temperature = np.random.uniform(*temp_range)
-                    action, prob, value = self.agent.select_action(
-                        state, valid_actions, training, temperature=temperature)
-
-                # 檢查危險動作
+            # 解碼狀態獲得棋盤和當前玩家
+            try:
                 board = state[:42].reshape(6, 7).astype(int)
-                mark = 1
+                current_player = int(state[42]) if len(state) > 42 else 1
+                
+                # 戰術優先級決策
+                if training:
+                    # 優先級1：如果可以獲勝，立即獲勝
+                    winning_move = self.if_i_can_finish(board, current_player, valid_actions)
+                    if winning_move != -1 and winning_move in valid_actions:
+                        action, prob, value = self.agent.select_action(state, valid_actions, training)
+                        return int(winning_move), prob, value  # 統一返回3個值
+                    
+                    # 優先級2：阻止對手獲勝
+                    blocking_move = self.if_i_will_lose(board, current_player, valid_actions)
+                    if blocking_move != -1 and blocking_move in valid_actions:
+                        action, prob, value = self.agent.select_action(state, valid_actions, training)
+                        return int(blocking_move), prob, value  # 統一返回3個值
+                
+                # 神經網路決策（考慮策略多樣性）
+                action, prob, value = self.agent.select_action(state, valid_actions, training)
 
-                if self.is_dangerous_move(board, mark, action, look_ahead_steps=3):
-                    return int(action), prob, value, True  # 確保返回 Python int
+                if training:
+                    if strategy == 'noisy':
+                        noise_level = 0.2 * (1 - progress) + 0.05 * progress  # 隨進度降低噪音
+                        if np.random.random() < noise_level:
+                            action = int(np.random.choice(valid_actions))  # 確保返回 Python int
 
-            return int(action), prob, value, False  # 確保返回 Python int
+                    elif strategy == 'exploration':
+                        temperature = 1.8 - 0.6 * progress  # 溫度隨進度降低
+                        exploration_bonus = 0.15 * (1 - progress)  # 探索獎勵隨進度降低
+                        action, prob, value = self.agent.select_action(
+                            state, valid_actions, training, temperature=temperature, exploration_bonus=exploration_bonus)
 
-        reward, episode_length = self.play_game(adaptive_agent_func, adaptive_agent_func, training=True)
+                    elif strategy == 'temperature':
+                        # 溫度範圍隨進度收窄
+                        temp_range = (0.8 + 0.4 * progress, 2.0 - 0.5 * progress)
+                        temperature = np.random.uniform(*temp_range)
+                        action, prob, value = self.agent.select_action(
+                            state, valid_actions, training, temperature=temperature)
+
+                    # 檢查危險動作（用解碼的當前玩家）
+                    if self.is_dangerous_move(board, current_player, action, look_ahead_steps=3):
+                        pass  # 記錄但不改變返回格式
+
+                return int(action), prob, value  # 統一返回3個值
+                
+            except Exception as e:
+                # 如果戰術分析失敗，使用基礎神經網路決策
+                logger.warning(f"adaptive_agent_func戰術分析失敗: {e}")
+                action, prob, value = self.agent.select_action(state, valid_actions, training)
+                return int(action), prob, value  # 統一返回3個值
+
+        reward, episode_length = self.play_game(adaptive_agent_func, adaptive_agent_func, training=True, training_player=None)
+        logger.debug(f"自適應自對弈完成，策略: {strategy}, 訓練進度: {progress:.2f}, 回合長度: {episode_length}")
         return reward, episode_length
 
     def diverse_training_episode(self, episode_num):
@@ -1508,16 +1763,16 @@ class ConnectXTrainer:
             # 每8回合對抗隨機對手（保持對弱對手的統治力）
         else:
             # 其他時候標準自對弈
-            if episode_num % 100 == 0:
-                return self.play_against_minimax_agent()
-            if episode_num % 500 == 0:
-                return self.play_against_random_agent()
-            if episode_num % 3 == 0:
-                return self.self_play_episode()
-            if episode_num % 3 == 1:
+            if episode_num % 6 <= 1:
+                return self.play_against_tactical_opponent()
+            elif episode_num % 6 == 2:
                 return self.adaptive_self_play_episode(episode_num)
-            if episode_num % 3 == 2:
+            elif episode_num % 6 == 3:
                 return self.diverse_self_play_episode(episode_num)
+            elif episode_num % 6 == 4:
+                return self.play_against_minimax_agent()
+            else:
+                return self.play_against_random_agent()
 
     def diverse_self_play_episode(self, episode_num):
         """高多樣性自對弈回合"""
@@ -1530,6 +1785,21 @@ class ConnectXTrainer:
             action, prob, value = self.agent.select_action(state, valid_actions, training)
 
             if training:
+                # 將狀態轉換為 6x7 棋盤並解碼當前玩家
+                board = state[:42].reshape(6, 7).astype(int)
+                mark = int(state[42]) if len(state) > 42 else 1  # 從狀態中解碼當前玩家
+
+                # 首先檢查是否可以直接獲勝
+                winning_move = self.if_i_can_finish(board, mark, valid_actions)
+                if winning_move != -1:
+                    return int(winning_move), 1.0, 0.0  # 統一返回3個值
+
+                # 其次檢查是否需要阻擋對手獲勝
+                blocking_move = self.if_i_will_lose(board, mark, valid_actions)
+                if blocking_move != -1:
+                    return int(blocking_move), 1.0, 0.0  # 統一返回3個值
+
+
                 # 動態調整的多樣性策略
                 randomness_level = base_randomness + np.random.uniform(-0.05, 0.05)
 
@@ -1570,13 +1840,12 @@ class ConnectXTrainer:
 
                 # 檢查危險動作
                 board = state[:42].reshape(6, 7).astype(int)
-                mark = 1
+                mark = int(state[42]) if len(state) > 42 else 1  # 從狀態中解碼當前玩家
 
                 if self.is_dangerous_move(board, mark, action, look_ahead_steps=3):
                     logger.debug(f"多樣性自對弈中選擇了危險動作 {action}")
-                    return int(action), prob, value, True  # 確保返回 Python int
 
-            return int(action), prob, value, False  # 確保返回 Python int
+            return int(action), prob, value  # 統一返回3個值
 
         reward, episode_length = self.play_game(diverse_agent_func, diverse_agent_func, training=True)
         logger.debug(f"高多樣性自對弈完成，隨機性: {base_randomness:.2f}, 回合長度: {episode_length}")
@@ -1708,6 +1977,377 @@ class ConnectXTrainer:
 
         return False
 
+    def _select_training_strategy(self, episode):
+        """動態選擇訓練策略以打破收斂停滯"""
+        # 基於episode數量和性能動態調整訓練策略
+        recent_win_rate = np.mean(self.win_rates[-5:]) if len(self.win_rates) >= 5 else 0.5
+        
+        # 早期階段（0-10000）：建立基本技能
+        if episode < 10000:
+            strategies = ['diverse_opponent', 'tactical_opponent', 'standard']
+            probabilities = [0.4, 0.4, 0.2]
+        
+        # 中期階段（10000-50000）：策略多樣化
+        elif episode < 50000:
+            if recent_win_rate > 0.8:  # 表現太好，需要更多挑戰
+                strategies = ['curriculum_self_play', 'exploration_enhanced', 'noise_injection', 'tactical_opponent']
+                probabilities = [0.3, 0.3, 0.2, 0.2]
+            else:  # 表現一般，平衡訓練
+                strategies = ['diverse_opponent', 'tactical_opponent', 'exploration_enhanced', 'standard']
+                probabilities = [0.3, 0.3, 0.2, 0.2]
+        
+        # 後期階段（50000+）：高級策略優化
+        else:
+            if recent_win_rate < 0.4:  # 表現下降，回到基礎訓練
+                strategies = ['diverse_opponent', 'tactical_opponent', 'standard']
+                probabilities = [0.4, 0.4, 0.2]
+            elif recent_win_rate > 0.9:  # 過度收斂，強制多樣化
+                strategies = ['curriculum_self_play', 'exploration_enhanced', 'noise_injection']
+                probabilities = [0.4, 0.3, 0.3]
+            else:  # 正常情況，均衡策略
+                strategies = ['curriculum_self_play', 'exploration_enhanced', 'diverse_opponent', 'tactical_opponent']
+                probabilities = [0.25, 0.25, 0.25, 0.25]
+        
+        return np.random.choice(strategies, p=probabilities)
+
+    def curriculum_self_play_episode(self, episode):
+        """課程化自對弈：對抗歷史版本的模型"""
+        # 每1000回合保存一個歷史模型
+        if episode % self.model_save_frequency == 0 and episode > 0:
+            self._save_historical_model(episode)
+        
+        if not self.historical_models:
+            # 沒有歷史模型時使用標準自對弈
+            return self.self_play_episode()
+        
+        # 選擇歷史模型（偏好較新的模型）
+        model_weights = np.exp(np.arange(len(self.historical_models))) 
+        model_weights /= model_weights.sum()
+        historical_model = np.random.choice(self.historical_models, p=model_weights)
+        
+        # 創建歷史模型代理函數
+        def historical_agent(state, valid_actions, training):
+            # 載入歷史模型參數進行預測
+            return self._predict_with_historical_model(historical_model, state, valid_actions)
+        
+        def current_agent(state, valid_actions, training):
+            return self.agent.select_action(state, valid_actions, training)
+        
+        # 隨機決定誰是當前模型
+        if np.random.random() < 0.5:
+            reward, episode_length = self.play_game(current_agent, historical_agent, training=True)
+        else:
+            reward, episode_length = self.play_game(historical_agent, current_agent, training=True)
+            reward = -reward  # 翻轉獎勵
+        
+        logger.debug(f"課程化自對弈完成，對抗歷史模型，回合長度: {episode_length}")
+        return reward, episode_length
+
+    def exploration_enhanced_self_play(self, episode):
+        """探索增強自對弈"""
+        # 動態調整探索率
+        self.current_exploration = max(
+            self.min_exploration, 
+            self.current_exploration * self.exploration_decay
+        )
+        
+        def exploration_agent(state, valid_actions, training):
+            action, prob, value = self.agent.select_action(state, valid_actions, training)
+            
+            if training and np.random.random() < self.current_exploration:
+                # 探索性動作選擇
+                board = state[:42].reshape(6, 7).astype(int)
+                mark = int(state[42]) if len(state) > 42 else 1
+                
+                # 戰術性探索：在安全的前提下選擇次優動作
+                safe_actions, dangerous_actions = self.filter_safe_actions(board, mark, valid_actions, look_ahead_steps=2)
+                
+                if len(safe_actions) > 1:
+                    # 從安全動作中隨機選擇（排除最優動作）
+                    if action in safe_actions:
+                        safe_actions.remove(action)
+                    if safe_actions:
+                        action = int(np.random.choice(safe_actions))
+                        logger.debug(f"探索增強：選擇探索動作 {action} (探索率: {self.current_exploration:.3f})")
+            
+            return int(action), prob, value  # 統一返回3個值
+        
+        reward, episode_length = self.play_game(exploration_agent, exploration_agent, training=True)
+        logger.debug(f"探索增強自對弈完成，探索率: {self.current_exploration:.3f}, 回合長度: {episode_length}")
+        return reward, episode_length
+
+    def noisy_self_play_episode(self, episode):
+        """注入噪聲的自對弈"""
+        def noisy_agent(state, valid_actions, training):
+            action, prob, value = self.agent.select_action(state, valid_actions, training)
+            
+            if training:
+                # 在動作概率中注入噪聲
+                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.agent.device)
+                self.agent.policy_net.eval()
+                with torch.no_grad():
+                    action_probs, _ = self.agent.policy_net(state_tensor)
+                
+                action_probs = action_probs.cpu().numpy()[0]
+                
+                # 添加Dirichlet噪聲
+                noise = np.random.dirichlet([0.3] * 7)
+                noisy_probs = 0.75 * action_probs + 0.25 * noise
+                
+                # 屏蔽無效動作
+                masked_probs = np.zeros_like(noisy_probs)
+                masked_probs[valid_actions] = noisy_probs[valid_actions]
+                
+                if masked_probs.sum() > 0:
+                    masked_probs /= masked_probs.sum()
+                    action = int(np.random.choice(7, p=masked_probs))
+                    if action not in valid_actions:
+                        action = int(np.random.choice(valid_actions))
+                    logger.debug(f"噪聲注入：選擇動作 {action}")
+            
+            return int(action), prob, value  # 統一返回3個值
+        
+        reward, episode_length = self.play_game(noisy_agent, noisy_agent, training=True)
+        logger.debug(f"噪聲自對弈完成，回合長度: {episode_length}")
+        return reward, episode_length
+
+    def _save_historical_model(self, episode):
+        """保存歷史模型"""
+        model_state = {
+            'episode': episode,
+            'policy_net_state': self.agent.policy_net.state_dict().copy(),
+            'win_rates': self.win_rates[-10:] if self.win_rates else []
+        }
+        
+        self.historical_models.append(model_state)
+        
+        # 限制歷史模型數量
+        max_historical_models = 10
+        if len(self.historical_models) > max_historical_models:
+            self.historical_models = self.historical_models[-max_historical_models:]
+        
+        logger.info(f"保存歷史模型 (episode {episode})，當前歷史模型數量: {len(self.historical_models)}")
+
+    def _predict_with_historical_model(self, historical_model, state, valid_actions):
+        """使用歷史模型進行預測"""
+        try:
+            # 臨時載入歷史模型參數
+            current_state = self.agent.policy_net.state_dict().copy()
+            self.agent.policy_net.load_state_dict(historical_model['policy_net_state'])
+            
+            # 進行預測
+            action, prob, value = self.agent.select_action(state, valid_actions, training=False)
+            
+            # 恢復當前模型參數
+            self.agent.policy_net.load_state_dict(current_state)
+            
+            return int(action), prob, value  # 統一返回3個值
+            
+        except Exception as e:
+            logger.warning(f"歷史模型預測失敗: {e}")
+            # 失敗時使用隨機動作
+            action = int(np.random.choice(valid_actions))
+            return action, 0.0, 0.0  # 統一返回3個值
+
+    def _detect_convergence_stagnation(self, episode, current_win_rate):
+        """檢測策略收斂停滯"""
+        if len(self.win_rates) < 10:  # 需要足夠的歷史數據
+            return False
+        
+        # 檢測條件1：自對弈勝率過低（說明策略單一化）
+        if hasattr(self, 'last_self_play_rate'):
+            if self.last_self_play_rate < 0.4 and episode > 50000:
+                logger.info(f"檢測到自對弈勝率過低: {self.last_self_play_rate:.3f}")
+                return True
+        
+        # 檢測條件2：勝率變化很小（策略穩定但可能停滞）
+        recent_rates = self.win_rates[-10:]
+        win_rate_std = np.std(recent_rates)
+        if win_rate_std < 0.02 and episode > 30000:  # 勝率變化很小
+            logger.info(f"檢測到勝率變化過小: std={win_rate_std:.4f}")
+            return True
+        
+        # 檢測條件3：長期無改進
+        if len(self.win_rates) >= 20:
+            recent_avg = np.mean(self.win_rates[-10:])
+            older_avg = np.mean(self.win_rates[-20:-10])
+            if abs(recent_avg - older_avg) < 0.01 and episode > 40000:
+                logger.info(f"檢測到長期無改進: recent={recent_avg:.3f}, older={older_avg:.3f}")
+                return True
+        
+        return False
+
+    def _handle_convergence_stagnation(self, episode):
+        """處理收斂停滯"""
+        # 策略1：增加探索率
+        self.current_exploration = min(0.4, self.current_exploration * 1.5)
+        logger.info(f"增加探索率至: {self.current_exploration:.3f}")
+        
+        # 策略2：調整學習率
+        for param_group in self.agent.optimizer.param_groups:
+            param_group['lr'] = min(param_group['lr'] * 1.2, 1e-3)
+        logger.info(f"調整學習率至: {param_group['lr']:.2e}")
+        
+        # 策略3：增加熵係數（鼓勵探索）
+        if hasattr(self.agent, 'entropy_coef'):
+            self.agent.entropy_coef = min(0.05, self.agent.entropy_coef * 1.3)
+            logger.info(f"增加熵係數至: {self.agent.entropy_coef:.4f}")
+        
+        # 策略4：重置部分網絡權重（輕微擾動）
+        self._partially_reset_network(reset_ratio=0.05)
+        
+        # 策略5：強制多樣化訓練
+        self._force_diverse_training_for_next_episodes = 50
+
+    def _partially_reset_network(self, reset_ratio=0.05):
+        """部分重置網絡權重以打破收斂停滯"""
+        with torch.no_grad():
+            for name, param in self.agent.policy_net.named_parameters():
+                if 'weight' in name and len(param.shape) >= 2:
+                    # 隨機選擇一部分權重進行重置
+                    mask = torch.rand_like(param) < reset_ratio
+                    if mask.any():
+                        # 使用Xavier初始化重置選中的權重
+                        reset_values = torch.zeros_like(param)
+                        torch.nn.init.xavier_uniform_(reset_values)
+                        param[mask] = reset_values[mask]
+        
+        logger.info(f"部分重置網絡權重 ({reset_ratio*100:.1f}%)")
+
+    def create_tactical_opponent(self):
+        """創建戰術增強的對手函數"""
+        def tactical_opponent(state, valid_actions, training):
+            """戰術增強的對手，優先使用規則，然後用神經網路"""
+            # 解碼狀態獲得棋盤和當前玩家
+            try:
+                decoded_board, current_player = self.decode_state(state)
+                # 轉換為 numpy array 以便使用輔助函數
+                board_array = np.array(decoded_board)
+                
+                # 優先級1：如果可以獲勝，立即獲勝
+                winning_move = self.if_i_can_finish(board_array, current_player, valid_actions)
+                if winning_move != -1 and winning_move in valid_actions:
+                    # 使用神經網路獲得機率和價值（用於一致的返回格式）
+                    state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.agent.device)
+                    self.agent.policy_net.eval()
+                    with torch.no_grad():
+                        action_probs, state_value = self.agent.policy_net(state_tensor)
+                    prob = action_probs[0][winning_move].item()
+                    value = state_value.item()
+                    return winning_move, prob, value  # 統一返回3個值
+
+                # 優先級2：阻止對手獲勝
+                blocking_move = self.if_i_will_lose(board_array, current_player, valid_actions)
+                if blocking_move != -1 and blocking_move in valid_actions:
+                    state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.agent.device)
+                    self.agent.policy_net.eval()
+                    with torch.no_grad():
+                        action_probs, state_value = self.agent.policy_net(state_tensor)
+                    prob = action_probs[0][blocking_move].item()
+                    value = state_value.item()
+                    return blocking_move, prob, value  # 統一返回3個值
+
+                # 優先級3：避免危險動作
+                safe_actions = []
+                for action in valid_actions:
+                    if not self.is_dangerous_move(board_array, current_player, action, look_ahead_steps=2):
+                        safe_actions.append(action)
+                
+                # 如果有安全動作，從中選擇
+                if safe_actions:
+                    actions_to_use = safe_actions
+                else:
+                    # 如果所有動作都危險，使用所有有效動作
+                    actions_to_use = valid_actions
+
+                # 使用神經網路在可用動作中選擇
+                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.agent.device)
+                self.agent.policy_net.eval()
+                with torch.no_grad():
+                    action_probs, state_value = self.agent.policy_net(state_tensor)
+                
+                # 過濾機率分佈，只考慮可用動作
+                action_probs_np = action_probs.cpu().numpy()[0]
+                filtered_probs = np.zeros_like(action_probs_np)
+                for action in actions_to_use:
+                    filtered_probs[action] = action_probs_np[action]
+                
+                # 重新正規化
+                if filtered_probs.sum() > 0:
+                    filtered_probs = filtered_probs / filtered_probs.sum()
+                else:
+                    # 如果所有機率都是0，平均分配
+                    for action in actions_to_use:
+                        filtered_probs[action] = 1.0 / len(actions_to_use)
+
+                # 根據訓練模式選擇動作
+                if training:
+                    # 訓練模式：添加探索
+                    action = np.random.choice(7, p=filtered_probs)
+                else:
+                    # 評估模式：選擇最高機率動作
+                    action = np.argmax(filtered_probs)
+
+                prob = filtered_probs[action]
+                value_item = state_value.item()
+
+                # 記錄是否危險但不改變返回格式
+                is_dangerous = self.is_dangerous_move(board_array, current_player, action, look_ahead_steps=2)
+                if is_dangerous:
+                    logger.debug(f"戰術對手選擇了危險動作: {action}")
+
+                return int(action), prob, value_item  # 統一返回3個值
+            
+            except Exception as e:
+                # 如果戰術分析失敗，退回到純神經網路決策
+                logger.warning(f"戰術對手分析失敗，使用神經網路決策: {e}")
+                action, prob, value = self.agent.select_action(state, valid_actions, training)
+                return int(action), prob, value  # 統一返回3個值
+
+        return tactical_opponent
+
+    def decode_state(self, state_tensor):
+        """解碼狀態張量為棋盤和當前玩家"""
+        # 將狀態從 GPU 轉到 CPU 並轉為 numpy
+        if isinstance(state_tensor, torch.Tensor):
+            state_np = state_tensor.cpu().numpy()
+        else:
+            state_np = np.array(state_tensor)
+        
+        # 狀態編碼格式：126維 = 3個通道 × 6×7
+        # 通道 1 (0-41): 當前玩家的棋子
+        # 通道 2 (42-83): 對手的棋子  
+        # 通道 3 (84-125): 空位
+        
+        if len(state_np) != 126:
+            logger.warning(f"狀態維度錯誤: 期望126，實際{len(state_np)}")
+            # 創建空棋盤作為備用
+            return np.zeros((6, 7), dtype=int), 1
+        
+        # 重構三個通道
+        player_pieces = state_np[:42].reshape(6, 7)
+        opponent_pieces = state_np[42:84].reshape(6, 7) 
+        empty_spaces = state_np[84:126].reshape(6, 7)
+        
+        # 重構原始棋盤
+        board = np.zeros((6, 7), dtype=int)
+        
+        # 假設當前玩家是玩家1（這個假設可能需要調整）
+        current_player = 1
+        
+        # 重構棋盤：玩家1的位置標記為1，玩家2的位置標記為2
+        board[player_pieces == 1] = current_player
+        board[opponent_pieces == 1] = 3 - current_player  # 對手標記
+        
+        # 驗證重構的正確性
+        total_pieces = np.sum(player_pieces) + np.sum(opponent_pieces)
+        empty_positions = np.sum(empty_spaces)
+        
+        if abs(total_pieces + empty_positions - 42) > 0.1:
+            logger.warning(f"棋盤重構可能有問題: 總棋子{total_pieces}, 空位{empty_positions}")
+        
+        return board, current_player
+
     def filter_safe_actions(self, board, mark, valid_actions, look_ahead_steps=3):
         """過濾出安全的動作（不會讓對手快速獲勝）"""
         safe_actions = []
@@ -1728,33 +2368,53 @@ class ConnectXTrainer:
     def play_against_random_agent(self):
         """對抗隨機對手的訓練回合"""
         def random_agent(state, valid_actions, training):
-            # 將狀態轉換為 6x7 棋盤
-            board = state[:42].reshape(6, 7).astype(int)
-            mark = 2  # 隨機agent通常是玩家2
+            # 從126維編碼狀態重構棋盤
+            try:
+                if len(state) != 126:
+                    raise ValueError(f"狀態維度錯誤: {len(state)}")
+                
+                # 重構三個通道
+                player_pieces = state[:42].reshape(6, 7)
+                opponent_pieces = state[42:84].reshape(6, 7) 
+                
+                # 重構原始棋盤
+                board = np.zeros((6, 7), dtype=int)
+                board[player_pieces > 0.5] = 2  # 隨機agent假設自己是玩家2
+                board[opponent_pieces > 0.5] = 1  # 對手是玩家1
+                
+                mark = 2  # 隨機agent通常是玩家2
 
-            # 首先檢查是否可以直接獲勝
-            winning_move = self.if_i_can_finish(board, mark, valid_actions)
-            if winning_move != -1:
-                return winning_move, 1.0, 0.0
+                # 首先檢查是否可以直接獲勝
+                winning_move = self.if_i_can_finish(board, mark, valid_actions)
+                if winning_move != -1:
+                    logger.debug(f"隨機agent發現獲勝機會: 動作 {winning_move}")
+                    return winning_move, 1.0, 0.0
 
-            # 其次檢查是否需要阻擋對手獲勝
-            blocking_move = self.if_i_will_lose(board, mark, valid_actions)
-            if blocking_move != -1:
-                return blocking_move, 1.0, 0.0
+                # 其次檢查是否需要阻擋對手獲勝
+                blocking_move = self.if_i_will_lose(board, mark, valid_actions)
+                if blocking_move != -1:
+                    logger.debug(f"隨機agent發現需要阻擋: 動作 {blocking_move}")
+                    return blocking_move, 1.0, 0.0
 
-            # 過濾危險動作
-            safe_actions, dangerous_actions = self.filter_safe_actions(board, mark, valid_actions)
+                # 過濾危險動作
+                safe_actions, dangerous_actions = self.filter_safe_actions(board, mark, valid_actions)
 
-            # 優先選擇安全動作
-            if safe_actions:
-                action = random.choice(safe_actions)
-            else:
-                # 如果沒有安全動作，從所有動作中選擇（但記錄警告）
+                # 優先選擇安全動作
+                if safe_actions:
+                    action = random.choice(safe_actions)
+                else:
+                    # 如果沒有安全動作，從所有動作中選擇（但記錄警告）
+                    action = random.choice(valid_actions)
+                    if training:
+                        logger.debug(f"隨機agent被迫選擇危險動作: {action}")
+
+                return action, 1.0/len(valid_actions), 0.0
+                
+            except Exception as e:
+                logger.warning(f"隨機agent狀態解析失敗: {e}")
+                # 回退到純隨機選擇
                 action = random.choice(valid_actions)
-                if training:
-                    logger.debug(f"隨機agent被迫選擇危險動作: {action}")
-
-            return action, 1.0/len(valid_actions), 0.0
+                return action, 1.0/len(valid_actions), 0.0
 
         def trained_agent(state, valid_actions, training):
             # 獲取原始動作
@@ -1762,22 +2422,49 @@ class ConnectXTrainer:
 
             if training:
                 # 在訓練模式下檢測危險動作並給予懲罰
-                board = state[:42].reshape(6, 7).astype(int)
-                mark = 1  # 訓練的agent通常是玩家1
+                try:
+                    if len(state) == 126:
+                        # 從126維編碼狀態重構棋盤
+                        player_pieces = state[:42].reshape(6, 7)
+                        opponent_pieces = state[42:84].reshape(6, 7)
+                        
+                        board = np.zeros((6, 7), dtype=int)
+                        board[player_pieces > 0.5] = 1  # 當前玩家
+                        board[opponent_pieces > 0.5] = 2  # 對手
+                        
+                        mark = 1  # 假設訓練agent是玩家1
+                        
+                        # 檢查選擇的動作是否危險
+                        if self.is_dangerous_move(board, mark, action, look_ahead_steps=3):
+                            logger.debug(f"訓練agent選擇了危險動作 {action}")
+                except Exception as e:
+                    logger.debug(f"訓練agent危險動作檢測失敗: {e}")
 
-                # 檢查選擇的動作是否危險
-                if self.is_dangerous_move(board, mark, action, look_ahead_steps=3):
-                    # 危險動作懲罰：給予負獎勵
-                    danger_penalty = -0.5
-                    # 注意：這裡不能直接store_transition，因為這會在正常的遊戲流程之外
-                    # 我們將在play_game函數中處理這個懲罰
-                    logger.debug(f"訓練agent選擇了危險動作 {action}")
-                    # 返回動作時標記危險
-                    return action, prob, value, True  # 額外返回危險標記
-
-            return action, prob, value, False  # 返回安全標記
+            return action, prob, value  # 統一返回3個值
 
         reward, episode_length = self.play_game(trained_agent, random_agent, training=True)
+        return reward, episode_length
+
+    def play_against_tactical_opponent(self):
+        """對抗戰術對手的訓練回合"""
+
+        # 創建訓練中的智能體函數
+        def trained_agent(state, valid_actions, training):
+            """訓練中的智能體，使用神經網路決策"""
+            return self.agent.select_action(state, valid_actions, training)
+
+        # 創建戰術對手函數
+        tactical_opponent_func = self.create_tactical_opponent()
+
+        # 使用新的play_game_with_different_agents方法
+        reward, episode_length = self.play_game_with_different_agents(
+            trained_agent, 
+            tactical_opponent_func, 
+            training=True,
+            training_player=None  # 隨機選擇訓練玩家
+        )
+        
+        logger.debug(f"戰術對手訓練完成，回合長度: {episode_length}")
         return reward, episode_length
 
     def play_against_minimax_agent(self):
@@ -1785,7 +2472,7 @@ class ConnectXTrainer:
         def minimax_agent(state, valid_actions, training):
             # 將狀態轉換為 6x7 棋盤
             board = state[:42].reshape(6, 7).astype(int)
-            mark = 2  # minimax agent通常是玩家2
+            mark = int(state[42]) if len(state) > 42 else 2  # 從狀態中解碼當前玩家
 
             # 首先檢查是否可以直接獲勝
             winning_move = self.if_i_can_finish(board, mark, valid_actions)
@@ -1818,14 +2505,13 @@ class ConnectXTrainer:
             if training:
                 # 在訓練模式下檢測危險動作並給予懲罰
                 board = state[:42].reshape(6, 7).astype(int)
-                mark = 1  # 訓練的agent通常是玩家1
+                mark = int(state[42]) if len(state) > 42 else 1  # 從狀態中解碼當前玩家
 
                 # 檢查選擇的動作是否危險
                 if self.is_dangerous_move(board, mark, action, look_ahead_steps=3):
                     logger.debug(f"訓練agent選擇了危險動作 {action}")
-                    return action, prob, value, True  # 額外返回危險標記
 
-            return action, prob, value, False  # 返回安全標記
+            return action, prob, value  # 統一返回3個值
 
         reward, episode_length = self.play_game(trained_agent, minimax_agent, training=True)
         return reward, episode_length
@@ -2103,6 +2789,10 @@ class ConnectXTrainer:
         logger.info(f"評分詳情: 基礎分={base_score:.3f}, 平局獎勵={draw_bonus:.3f}, "
                    f"不敗獎勵={undefeated_bonus:.3f}, 統治懲罰={dominance_penalty:.3f}")
         logger.info(f"多樣化自對弈最終評分: {final_score:.3f}")
+        
+        # 保存自對弈勝率以便監控收斂停滯
+        self.last_self_play_rate = win_rate
+        
         return final_score
 
     def evaluate_with_metrics(self, num_games=50):
@@ -2302,13 +2992,30 @@ class ConnectXTrainer:
         if start_episode > 0:
             logger.info(f"從第 {start_episode} 回合繼續訓練")
 
+        logger.info(f'{self.config.get('training', {}).get('opponent_diversity', False)}')
         logger.info(f"最大訓練回合: {self.config['training']['max_episodes']}")
         for episode in range(start_episode, self.config['training']['max_episodes']):
             try:
-                # 多樣性訓練回合（根據配置選擇）
-                if self.config.get('training', {}).get('opponent_diversity', False):
+                # 選擇訓練方式 - 增加策略多樣性以避免收斂停滯
+                training_strategy = self._select_training_strategy(episode)
+                
+                if training_strategy == 'curriculum_self_play':
+                    # 課程化自對弈：使用歷史版本的agent
+                    reward, episode_length = self.curriculum_self_play_episode(episode)
+                elif training_strategy == 'diverse_opponent':
+                    # 多樣性對手訓練
                     reward, episode_length = self.diverse_training_episode(episode)
+                elif training_strategy == 'exploration_enhanced':
+                    # 探索增強自對弈
+                    reward, episode_length = self.exploration_enhanced_self_play(episode)
+                elif training_strategy == 'tactical_opponent':
+                    # 戰術對手訓練
+                    reward, episode_length = self.enhanced_self_play_episode()
+                elif training_strategy == 'noise_injection':
+                    # 注入噪聲的自對弈
+                    reward, episode_length = self.noisy_self_play_episode(episode)
                 else:
+                    # 標準自對弈（減少使用頻率）
                     reward, episode_length = self.self_play_episode()
 
                 self.episode_rewards.append(reward)
@@ -2394,6 +3101,12 @@ class ConnectXTrainer:
                     avg_reward = np.mean(self.episode_rewards[-100:]) if self.episode_rewards else 0
 
                     logger.info(f"平均獎勵: {avg_reward:.3f}, 回合長度: {episode_length}")
+                    
+                    # 檢測收斂停滯並應對
+                    stagnation_detected = self._detect_convergence_stagnation(episode, win_rate)
+                    if stagnation_detected:
+                        logger.warning("檢測到策略收斂停滯，採取應對措施...")
+                        self._handle_convergence_stagnation(episode)
 
                     # 更新學習率調度器
                     self.agent.scheduler.step(win_rate)
@@ -2415,18 +3128,19 @@ class ConnectXTrainer:
                         break
 
                     # 每100回合進行遊戲可視化
-                    if episode % 100 == 0 and VISUALIZATION_AVAILABLE:
+                    if episode % 50 == 0 and VISUALIZATION_AVAILABLE:
                         try:
                             # 確定對手類型
                             if episode >= 5000:
                                 opponent_type = "minimax"
                             elif episode >= 3000:
                                 opponent_type = "self_play"
-                            else:
-                                opponent_type = "random"
                             
-                            logger.info(f"第 {episode} 回合：展示對戰 {opponent_type} 對手")
-                            self.demo_game_with_visualization(opponent_type)
+                            logger.info(f"Episode {episode}: Showing battle vs {opponent_type} opponent")
+                            
+                            # 獲取可視化類型設置
+                            viz_type = self.config.get('visualization', {}).get('type', 'text')  # 默認使用text避免字體問題
+                            self.demo_game_with_visualization(episode, viz_type)
                         except Exception as e:
                             logger.warning(f"可視化第 {episode} 回合時出錯: {e}")
 
@@ -2491,10 +3205,24 @@ class ConnectXTrainer:
                         agent_name = agent2_name
                     
                     # 處理返回值
-                    if len(result) >= 3:
-                        action = result[0]
-                    else:
-                        action = result
+                    try:
+                        if isinstance(result, tuple) and len(result) >= 3:
+                            action = int(result[0])  # 確保動作是整數
+                        elif isinstance(result, tuple) and len(result) == 1:
+                            action = int(result[0])
+                        elif isinstance(result, (int, np.integer)):
+                            action = int(result)
+                        else:
+                            action = int(result)  # 嘗試轉換為整數
+                        
+                        # 驗證動作有效性
+                        if action not in valid_actions:
+                            logger.warning(f"無效動作 {action}，使用隨機有效動作")
+                            action = int(np.random.choice(valid_actions))
+                            
+                    except (TypeError, ValueError, IndexError) as e:
+                        logger.error(f"處理智能體返回值時出錯: {e}, result: {result}")
+                        action = int(np.random.choice(valid_actions))
                     
                     actions.append(action)
                     move_history.append({
@@ -2504,11 +3232,16 @@ class ConnectXTrainer:
                         'action': action,
                         'board_before': board.copy()
                     })
-                    break
+                else:
+                    # 非活躍玩家 - 使用虛擬動作
+                    actions.append(0)
             
             # 執行動作
-            if actions:
+            if len(actions) == 2:
                 env.step(actions)
+            else:
+                logger.error(f"動作數量錯誤: 需要2個動作，但得到{len(actions)}個")
+                break
             
             move_count += 1
         
@@ -2540,7 +3273,7 @@ class ConnectXTrainer:
         return final_result
 
     def _create_game_visualization(self, game_history, move_history, agent1_name, agent2_name, final_result, save_path=None):
-        """創建遊戲可視化"""
+        """創建遊戲可視化 - 使用英文避免字體問題"""
         if not game_history:
             return
         
@@ -2553,8 +3286,10 @@ class ConnectXTrainer:
             game_history = [game_history[i] for i in indices if i < len(game_history)]
             axes = axes[:len(game_history)]
         
-        fig.suptitle(f'🎮 ConnectX 對戰: {agent1_name} vs {agent2_name}\n結果: {final_result}', 
-                    fontsize=14, fontweight='bold')
+        # 使用英文避免字體問題
+        title = f'ConnectX Battle: {agent1_name} vs {agent2_name}'
+        result_text = final_result.replace('獲勝', 'Wins').replace('平局', 'Draw').replace('vs', 'vs')
+        fig.suptitle(f'{title}\nResult: {result_text}', fontsize=14, fontweight='bold')
         
         colors = {0: 'white', 1: 'red', 2: 'blue'}
         player_names = {1: agent1_name, 2: agent2_name}
@@ -2582,22 +3317,22 @@ class ConnectXTrainer:
             for i in range(6):
                 ax.axhline(i - 0.5, color='black', linewidth=1)
             
-            # 添加標題
+            # 添加標題 - 使用英文
             if idx == 0:
-                ax.set_title('初始狀態', fontsize=10)
+                ax.set_title('Initial State', fontsize=10)
             elif idx == len(game_history) - 1:
-                ax.set_title('最終狀態', fontsize=10)
+                ax.set_title('Final State', fontsize=10)
             else:
                 step_num = idx if len(game_history) <= 6 else [0, len(game_history)//4, len(game_history)//2, 3*len(game_history)//4, len(game_history)-1][idx]
-                ax.set_title(f'第 {step_num} 步', fontsize=10)
+                ax.set_title(f'Step {step_num + 1}', fontsize=10)
             
             ax.set_xticks([])
             ax.set_yticks([])
         
-        # 添加圖例
+        # 添加圖例 - 使用英文
         legend_elements = [
-            patches.Patch(color=[1, 0.3, 0.3], label=f'{agent1_name} (紅)'),
-            patches.Patch(color=[0.3, 0.3, 1], label=f'{agent2_name} (藍)')
+            patches.Patch(color=[1, 0.3, 0.3], label=f'{agent1_name} (Red)'),
+            patches.Patch(color=[0.3, 0.3, 1], label=f'{agent2_name} (Blue)')
         ]
         fig.legend(handles=legend_elements, loc='lower center', ncol=2)
         
@@ -2606,37 +3341,268 @@ class ConnectXTrainer:
         # 保存或顯示
         if save_path:
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            logger.info(f"遊戲可視化已保存: {save_path}")
+            logger.info(f"Game visualization saved: {save_path}")
         else:
             # 創建保存目錄
             os.makedirs('game_visualizations', exist_ok=True)
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             save_path = f'game_visualizations/game_{agent1_name}_vs_{agent2_name}_{timestamp}.png'
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            logger.info(f"遊戲可視化已保存: {save_path}")
+            logger.info(f"Game visualization saved: {save_path}")
         
         plt.close()
 
-    def demo_game_with_visualization(self, episode_num):
-        """每100個episode進行一次可視化演示"""
-        if not VISUALIZATION_AVAILABLE:
-            return
+    def create_simple_text_visualization(self, game_history, move_history, agent1_name, agent2_name, final_result):
+        """創建簡單的文本可視化，避免字體問題"""
+        print("="*60)
+        print(f"ConnectX Battle: {agent1_name} vs {agent2_name}")
+        print("="*60)
         
-        logger.info(f"🎬 Episode {episode_num}: 開始可視化演示")
+        if not game_history:
+            print("No game data available")
+            return
+            
+        # 顯示最終棋盤狀態
+        final_board = np.array(game_history[-1]).reshape(6, 7)
+        print("Final Board State:")
+        print("  ", " ".join([str(i) for i in range(7)]))
+        for i, row in enumerate(final_board):
+            row_str = " ".join(['.' if x == 0 else ('X' if x == 1 else 'O') for x in row])
+            print(f"{i}: {row_str}")
+        
+        print(f"\nResult: {final_result}")
+        print(f"Total moves: {len(move_history)}")
+        
+        # 顯示移動歷史
+        if move_history:
+            print("\nMove History:")
+            for move in move_history[-5:]:  # 只顯示最後5步
+                player_symbol = 'X' if move['player'] == 1 else 'O'
+                print(f"  {move['agent_name']} ({player_symbol}): Column {move['action']}")
+        
+        print("="*60)
+
+    def create_video_visualization(self, game_history, move_history, agent1_name, agent2_name, final_result, save_path=None):
+        """創建視頻可視化（需要 opencv-python）"""
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            logger.warning("OpenCV not available. Cannot create video visualization.")
+            return self.create_simple_text_visualization(game_history, move_history, agent1_name, agent2_name, final_result)
+        
+        if not game_history:
+            return
+            
+        # 視頻參數
+        width, height = 700, 600
+        fps = 2  # 每秒2幀，慢一點看得清楚
+        
+        if save_path is None:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            os.makedirs('game_videos', exist_ok=True)
+            save_path = f'game_videos/game_{agent1_name}_vs_{agent2_name}_{timestamp}.mp4'
+        
+        # 創建視頻寫入器
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        video_writer = cv2.VideoWriter(save_path, fourcc, fps, (width, height))
+        
+        try:
+            for frame_idx, board_state in enumerate(game_history):
+                # 創建幀
+                frame = np.ones((height, width, 3), dtype=np.uint8) * 255
+                
+                # 繪製棋盤
+                board_matrix = np.array(board_state).reshape(6, 7)
+                cell_width = width // 7
+                cell_height = (height - 100) // 6  # 留100像素給標題
+                
+                # 繪製標題
+                title = f"{agent1_name} vs {agent2_name} - Step {frame_idx + 1}"
+                cv2.putText(frame, title, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+                
+                # 繪製棋盤格子和棋子
+                for i in range(6):
+                    for j in range(7):
+                        # 計算格子位置
+                        x = j * cell_width
+                        y = 50 + i * cell_height  # 50像素偏移給標題留空間
+                        
+                        # 繪製格子邊框
+                        cv2.rectangle(frame, (x, y), (x + cell_width, y + cell_height), (0, 0, 0), 2)
+                        
+                        # 繪製棋子
+                        center_x = x + cell_width // 2
+                        center_y = y + cell_height // 2
+                        radius = min(cell_width, cell_height) // 3
+                        
+                        if board_matrix[i, j] == 1:  # 玩家1 - 紅色
+                            cv2.circle(frame, (center_x, center_y), radius, (0, 0, 255), -1)
+                        elif board_matrix[i, j] == 2:  # 玩家2 - 藍色
+                            cv2.circle(frame, (center_x, center_y), radius, (255, 0, 0), -1)
+                
+                # 添加結果信息（只在最後一幀）
+                if frame_idx == len(game_history) - 1:
+                    result_text = final_result.replace('獲勝', 'Wins').replace('平局', 'Draw')
+                    cv2.putText(frame, f"Result: {result_text}", (10, height - 20), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                
+                # 寫入幀（重複寫入以延長顯示時間）
+                for _ in range(fps if frame_idx < len(game_history) - 1 else fps * 3):  # 最後一幀顯示更長時間
+                    video_writer.write(frame)
+            
+            logger.info(f"Video visualization saved: {save_path}")
+            
+        except Exception as e:
+            logger.error(f"Error creating video: {e}")
+        finally:
+            video_writer.release()
+
+    def visualize_game_enhanced(self, agent1_func, agent2_func, agent1_name="Agent1", agent2_name="Agent2", 
+                               visualization_type="matplotlib", save_path=None):
+        """增強版遊戲可視化，支持多種可視化方式
+        
+        Args:
+            visualization_type: "matplotlib", "text", "video", "all"
+        """
+        # 先運行遊戲獲取數據
+        logger.info(f"Starting enhanced visualization: {agent1_name} vs {agent2_name}")
+        
+        # 記錄遊戲狀態
+        game_history = []
+        move_history = []
+        
+        env = make("connectx", debug=False)
+        env.reset()
+        
+        move_count = 0
+        max_moves = 50
+        
+        while not env.done and move_count < max_moves:
+            # 記錄當前狀態
+            current_board = None
+            for player_idx in range(2):
+                if env.state[player_idx]['status'] == 'ACTIVE':
+                    board, player_mark = self.agent.extract_board_and_mark(env.state, player_idx)
+                    current_board = board
+                    break
+            
+            if current_board is not None:
+                game_history.append(current_board.copy())
+            
+            # 獲取動作
+            actions = []
+            for player_idx in range(2):
+                if env.state[player_idx]['status'] == 'ACTIVE':
+                    board, player_mark = self.agent.extract_board_and_mark(env.state, player_idx)
+                    state = self.agent.encode_state(board, player_mark)
+                    valid_actions = self.agent.get_valid_actions(board)
+                    
+                    if player_mark == 1:
+                        result = agent1_func(state, valid_actions, False)
+                        agent_name = agent1_name
+                    else:
+                        result = agent2_func(state, valid_actions, False)
+                        agent_name = agent2_name
+                    
+                    # 處理返回值
+                    try:
+                        if isinstance(result, tuple) and len(result) >= 3:
+                            action = int(result[0])
+                        else:
+                            action = int(result)
+                        
+                        if action not in valid_actions:
+                            action = int(np.random.choice(valid_actions))
+                            
+                    except (TypeError, ValueError, IndexError):
+                        action = int(np.random.choice(valid_actions))
+                    
+                    actions.append(action)
+                    move_history.append({
+                        'move': move_count + 1,
+                        'player': player_mark,
+                        'agent_name': agent_name,
+                        'action': action,
+                        'board_before': board.copy()
+                    })
+                else:
+                    actions.append(0)
+            
+            # 執行動作
+            if len(actions) == 2:
+                env.step(actions)
+            else:
+                break
+                
+            move_count += 1
+        
+        # 獲取最終狀態和結果
+        final_result = "In Progress"
+        if env.done and len(env.state) >= 2:
+            final_board = None
+            for player_idx in range(2):
+                board, _ = self.agent.extract_board_and_mark(env.state, player_idx)
+                final_board = board
+                break
+            
+            if final_board is not None:
+                game_history.append(final_board.copy())
+            
+            # 判斷結果
+            if env.state[0].get('reward', 0) == 1:
+                final_result = f"{agent1_name} Wins!"
+            elif env.state[1].get('reward', 0) == 1:
+                final_result = f"{agent2_name} Wins!"
+            else:
+                final_result = "Draw"
+        
+        # 根據類型選擇可視化方式
+        if visualization_type == "text":
+            self.create_simple_text_visualization(game_history, move_history, agent1_name, agent2_name, final_result)
+        elif visualization_type == "video":
+            self.create_video_visualization(game_history, move_history, agent1_name, agent2_name, final_result, save_path)
+        elif visualization_type == "all":
+            self.create_simple_text_visualization(game_history, move_history, agent1_name, agent2_name, final_result)
+            if VISUALIZATION_AVAILABLE:
+                self._create_game_visualization(game_history, move_history, agent1_name, agent2_name, final_result, save_path)
+            self.create_video_visualization(game_history, move_history, agent1_name, agent2_name, final_result, 
+                                          save_path.replace('.png', '.mp4') if save_path else None)
+        else:  # matplotlib (default)
+            if VISUALIZATION_AVAILABLE:
+                self._create_game_visualization(game_history, move_history, agent1_name, agent2_name, final_result, save_path)
+            else:
+                self.create_simple_text_visualization(game_history, move_history, agent1_name, agent2_name, final_result)
+        
+        logger.info(f"Enhanced visualization completed: {final_result}")
+        return final_result
+
+    def demo_game_with_visualization(self, episode_num, visualization_type="matplotlib"):
+        """每100個episode進行一次可視化演示
+        
+        Args:
+            episode_num: 當前episode數
+            visualization_type: 可視化類型 ("matplotlib", "text", "video", "all")
+        """
+        if not VISUALIZATION_AVAILABLE and visualization_type in ["matplotlib", "all"]:
+            logger.info(f"Matplotlib not available, using text visualization")
+            visualization_type = "text"
+        
+        logger.info(f"Episode {episode_num}: Starting {visualization_type} visualization demo")
         
         # 根據當前訓練階段選擇不同的對手
         if episode_num < 500:
             # 早期：主要對抗隨機對手
-            opponent_types = ["隨機對手", "簡單Minimax"]
+            opponent_types = ["Minimax", "自對弈"]
             weights = [0.7, 0.3]
         elif episode_num < 2000:
             # 中期：混合對手
-            opponent_types = ["隨機對手", "Minimax", "自對弈"]
-            weights = [0.4, 0.4, 0.2]
+            opponent_types = ["Minimax", "自對弈"]
+            weights = [0.5, 0.5]
         else:
             # 後期：主要自對弈和高級對手
             opponent_types = ["Minimax", "自對弈"]
-            weights = [0.6, 0.4]
+            weights = [0.2, 0.8]
         
         # 隨機選擇對手類型
         opponent_type = np.random.choice(opponent_types, p=weights)
@@ -2646,26 +3612,44 @@ class ConnectXTrainer:
             return self.agent.select_action(state, valid_actions, training=training)
         
         # 根據選擇創建對手
-        if opponent_type == "隨機對手":
-            def opponent(state, valid_actions, training=False):
-                action = np.random.choice(valid_actions)
-                return action, 1.0 / len(valid_actions), 0.0
-            opponent_name = "Random"
-            
-        elif opponent_type == "簡單Minimax" or opponent_type == "Minimax":
-            def opponent(state, valid_actions, training=False):
-                # 從狀態重建棋盤
-                board = [0] * 42
-                # 這裡需要從編碼狀態重建，簡化處理
-                action = np.random.choice(valid_actions)  # 簡化版本
-                return action, 1.0, 0.0
+
+        if opponent_type == "簡單Minimax" or opponent_type == "Minimax":
+            def minimax_agent(state, valid_actions, training):
+                # 將狀態轉換為 6x7 棋盤
+                board = state[:42].reshape(6, 7).astype(int)
+                mark = int(state[42]) if len(state) > 42 else 2  # 從狀態中解碼當前玩家
+
+                # 首先檢查是否可以直接獲勝
+                winning_move = self.if_i_can_finish(board, mark, valid_actions)
+                if winning_move != -1:
+                    return winning_move, 1.0, 0.0
+
+                # 其次檢查是否需要阻擋對手獲勝
+                blocking_move = self.if_i_will_lose(board, mark, valid_actions)
+                if blocking_move != -1:
+                    return blocking_move, 1.0, 0.0
+
+                # 過濾危險動作
+                safe_actions, dangerous_actions = self.filter_safe_actions(board, mark, valid_actions)
+
+                # 如果有安全動作，在安全動作中使用minimax
+                if safe_actions:
+                    best_action = self._minimax_move(board, safe_actions, depth=2)
+                else:
+                    # 如果沒有安全動作，仍使用minimax但記錄警告
+                    best_action = self._minimax_move(board, valid_actions, depth=2)
+                    if training:
+                        logger.debug(f"Minimax agent被迫選擇危險動作: {best_action}")
+
+                return best_action, 1.0, 0.0
+
+            opponent = minimax_agent
             opponent_name = "Minimax"
             
         else:  # 自對弈
-            def opponent(state, valid_actions, training=False):
-                return self.agent.select_action(state, valid_actions, training=training)
-            opponent_name = "Self-Play"
-        
+            opponent = self.create_tactical_opponent()
+            opponent_name = "Tactical-Opponent"
+            
         # 隨機決定誰先手
         if np.random.random() < 0.5:
             agent1_func, agent1_name = trained_agent, "PPO-Agent"
@@ -2676,11 +3660,21 @@ class ConnectXTrainer:
         
         # 執行可視化
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        save_path = f'game_visualizations/episode_{episode_num}_{agent1_name}_vs_{agent2_name}_{timestamp}.png'
         
-        result = self.visualize_game(agent1_func, agent2_func, agent1_name, agent2_name, save_path)
+        # 根據可視化類型選擇保存路徑
+        if visualization_type == "text":
+            save_path = None  # 文本可視化不需要保存路徑
+        elif visualization_type == "video":
+            os.makedirs('game_videos', exist_ok=True)
+            save_path = f'game_videos/episode_{episode_num}_{agent1_name}_vs_{agent2_name}_{timestamp}.mp4'
+        else:  # matplotlib 或 all
+            os.makedirs('game_visualizations', exist_ok=True)
+            save_path = f'game_visualizations/episode_{episode_num}_{agent1_name}_vs_{agent2_name}_{timestamp}.png'
         
-        logger.info(f"🎯 Episode {episode_num} 演示完成: {agent1_name} vs {agent2_name} - {result}")
+        result = self.visualize_game_enhanced(agent1_func, agent2_func, agent1_name, agent2_name, 
+                                            visualization_type, save_path)
+        
+        logger.info(f"Episode {episode_num} demo completed: {agent1_name} vs {agent2_name} - {result}")
 
     def save_checkpoint(self, filename):
         """保存檢查點"""
@@ -2910,7 +3904,7 @@ def create_default_config():
 
 def main():
     config_path = 'config.yaml'
-    load = 'checkpoints/checkpoint_episode_70000.pt'
+    load = 'checkpoints/checkpoint_episode_130000.pt'
     # load = False
 
     pretrain_epochs = 1
