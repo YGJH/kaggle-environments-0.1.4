@@ -546,9 +546,13 @@ class ConnectXTrainer:
         valid_samples = 0
 
         try:
+
+            if max_lines == -1:
+                with open(file_path, 'r') as f:
+                    max_lines = sum([1 for i in f])
+
             logger.info(f"載入訓練數據集: {file_path}")
             logger.info(f"限制載入行數: {max_lines}")
-
             # 第一次掃描：計算有效樣本數量
             logger.info("🔍 第一次掃描：計算有效樣本數量...")
             with open(file_path, 'r') as f:
@@ -593,7 +597,7 @@ class ConnectXTrainer:
             if valid_samples == 0:
                 logger.error("沒有找到任何有效樣本！")
                 return None, None
-
+            
             # 預分配記憶體 - 根據編碼模式調整
             input_size = self.config['agent']['input_size']
             states = np.zeros((valid_samples, input_size), dtype=np.float32)
@@ -605,7 +609,10 @@ class ConnectXTrainer:
             # 第二次掃描：載入數據
             logger.info("📥 第二次掃描：載入數據...")
             sample_idx = 0
-            
+            if max_lines == -1:
+                with open(file_path, 'r') as f:
+                    max_lines = sum([1 for i in f])
+
             with open(file_path, 'r') as f:
                 with tqdm(total=min(max_lines, valid_samples), desc="載入數據") as pbar:
                     for i, line in enumerate(f):
@@ -689,6 +696,9 @@ class ConnectXTrainer:
     def train(self, epochs=100, batch_size=128, max_lines=10000, memory_efficient=True):
         """監督學習訓練 - 支援記憶體優化模式"""
         logger.info("🚀 開始監督學習訓練")
+        if max_lines == -1:
+            with open("connectx-state-action-value.txt" , 'r') as f:
+                max_lines = sum([1 for i in f])
 
         if memory_efficient and max_lines > 20000:
             # 記憶體優化模式：分批載入訓練
@@ -1084,14 +1094,14 @@ def create_config(use_compact_encoding=True):
         'agent': {
             'input_size': input_size,
             'hidden_size': 150,     # 隱藏層大小
-            'num_layers': 3,        # 隱藏層數量（修正為合理值）
+            'num_layers': 300,        # 隱藏層數量（修正為合理值）
             'learning_rate': 0.001, # 學習率
             'weight_decay': 0.0001  # 權重衰減
         },
         'training': {
             'epochs': 200,          # 訓練epochs
             'batch_size': 128,      # 批次大小
-            'max_lines': 50000,     # 最大數據集行數
+            'max_lines': -1,     # 最大數據集行數
             'eval_games': 100,      # 評估遊戲數量
             'memory_efficient': True, # 是否使用記憶體優化模式
             'use_compact_encoding': use_compact_encoding,  # 是否使用緊湊編碼

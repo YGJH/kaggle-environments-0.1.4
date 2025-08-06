@@ -2899,7 +2899,7 @@ def create_default_config():
         },
         'evaluation': {
             'mode': 'comprehensive',  # random, comprehensive, detailed, minimax
-            'minimax_depth': 4,
+            'minimax_depth': 10,
             'weights': {
                 'vs_random': 0.4,
                 'vs_minimax': 0.4,
@@ -2910,7 +2910,7 @@ def create_default_config():
 
 def main():
     config_path = 'config.yaml'
-    load = 'checkpoints/checkpoint_episode_60000.pt'
+    load = 'checkpoints/checkpoint_episode_70000.pt'
     # load = False
 
     pretrain_epochs = 1
@@ -2946,6 +2946,7 @@ def main():
         logger.info(f"持續學習將使用最多 {continuous_learning_max} 個樣本")
 
     # 創建默認配置
+    import os
     if not os.path.exists(config_path):
         logger.info(f"創建默認配置文件: {config_path}")
         config = create_default_config()
