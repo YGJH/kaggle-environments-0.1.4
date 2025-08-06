@@ -21,6 +21,26 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "PyYAML"])
     import yaml
 
+try:
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    from matplotlib.animation import FuncAnimation
+    import matplotlib.colors as mcolors
+    VISUALIZATION_AVAILABLE = True
+except ImportError:
+    print("Matplotlib not found. Installing for visualization...")
+    try:
+        import subprocess
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "matplotlib"])
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+        from matplotlib.animation import FuncAnimation
+        import matplotlib.colors as mcolors
+        VISUALIZATION_AVAILABLE = True
+    except Exception:
+        print("⚠️ 無法安裝matplotlib，將跳過可視化功能")
+        VISUALIZATION_AVAILABLE = False
+
 from kaggle_environments import make, evaluate
 
 # Set up logging
@@ -1488,6 +1508,10 @@ class ConnectXTrainer:
             # 每8回合對抗隨機對手（保持對弱對手的統治力）
         else:
             # 其他時候標準自對弈
+            if episode_num % 100 == 0:
+                return self.play_against_minimax_agent()
+            if episode_num % 500 == 0:
+                return self.play_against_random_agent()
             if episode_num % 3 == 0:
                 return self.self_play_episode()
             if episode_num % 3 == 1:
@@ -2390,6 +2414,22 @@ class ConnectXTrainer:
                         logger.info(f"在第 {episode} 回合早停")
                         break
 
+                    # 每100回合進行遊戲可視化
+                    if episode % 100 == 0 and VISUALIZATION_AVAILABLE:
+                        try:
+                            # 確定對手類型
+                            if episode >= 5000:
+                                opponent_type = "minimax"
+                            elif episode >= 3000:
+                                opponent_type = "self_play"
+                            else:
+                                opponent_type = "random"
+                            
+                            logger.info(f"第 {episode} 回合：展示對戰 {opponent_type} 對手")
+                            self.demo_game_with_visualization(opponent_type)
+                        except Exception as e:
+                            logger.warning(f"可視化第 {episode} 回合時出錯: {e}")
+
                 # 定期檢查點
                 if episode % self.config['training']['checkpoint_frequency'] == 0 and episode > 0:
                     self.save_checkpoint(f"checkpoint_episode_{episode}.pt")
@@ -2401,6 +2441,246 @@ class ConnectXTrainer:
         logger.info("訓練完成！")
         logger.info(f"最佳勝率: {best_win_rate:.3f}")
         return self.agent
+
+    def visualize_game(self, agent1_func, agent2_func, agent1_name="Agent1", agent2_name="Agent2", save_path=None):
+        """可視化一局遊戲的過程"""
+        if not VISUALIZATION_AVAILABLE:
+            logger.warning("⚠️ matplotlib不可用，跳過遊戲可視化")
+            return None
+        
+        logger.info(f"🎮 開始可視化遊戲: {agent1_name} vs {agent2_name}")
+        
+        # 記錄遊戲狀態
+        game_history = []
+        move_history = []
+        
+        env = make("connectx", debug=False)
+        env.reset()
+        
+        move_count = 0
+        max_moves = 50
+        
+        while not env.done and move_count < max_moves:
+            # 記錄當前狀態
+            current_board = None
+            current_player = None
+            
+            for player_idx in range(2):
+                if env.state[player_idx]['status'] == 'ACTIVE':
+                    board, player_mark = self.agent.extract_board_and_mark(env.state, player_idx)
+                    current_board = board
+                    current_player = player_mark
+                    break
+            
+            if current_board is not None:
+                game_history.append(current_board.copy())
+            
+            # 獲取動作
+            actions = []
+            for player_idx in range(2):
+                if env.state[player_idx]['status'] == 'ACTIVE':
+                    board, player_mark = self.agent.extract_board_and_mark(env.state, player_idx)
+                    state = self.agent.encode_state(board, player_mark)
+                    valid_actions = self.agent.get_valid_actions(board)
+                    
+                    if player_mark == 1:
+                        result = agent1_func(state, valid_actions, False)
+                        agent_name = agent1_name
+                    else:
+                        result = agent2_func(state, valid_actions, False)
+                        agent_name = agent2_name
+                    
+                    # 處理返回值
+                    if len(result) >= 3:
+                        action = result[0]
+                    else:
+                        action = result
+                    
+                    actions.append(action)
+                    move_history.append({
+                        'move': move_count + 1,
+                        'player': player_mark,
+                        'agent_name': agent_name,
+                        'action': action,
+                        'board_before': board.copy()
+                    })
+                    break
+            
+            # 執行動作
+            if actions:
+                env.step(actions)
+            
+            move_count += 1
+        
+        # 獲取最終狀態和結果
+        final_board = None
+        final_result = "進行中"
+        
+        if env.done and len(env.state) >= 2:
+            for player_idx in range(2):
+                board, _ = self.agent.extract_board_and_mark(env.state, player_idx)
+                final_board = board
+                break
+            
+            if final_board is not None:
+                game_history.append(final_board.copy())
+            
+            # 判斷結果
+            if env.state[0].get('reward', 0) == 1:
+                final_result = f"{agent1_name} 獲勝!"
+            elif env.state[1].get('reward', 0) == 1:
+                final_result = f"{agent2_name} 獲勝!"
+            else:
+                final_result = "平局"
+        
+        # 創建可視化
+        self._create_game_visualization(game_history, move_history, agent1_name, agent2_name, final_result, save_path)
+        
+        logger.info(f"遊戲結束: {final_result}, 總步數: {len(move_history)}")
+        return final_result
+
+    def _create_game_visualization(self, game_history, move_history, agent1_name, agent2_name, final_result, save_path=None):
+        """創建遊戲可視化"""
+        if not game_history:
+            return
+        
+        fig, axes = plt.subplots(1, min(len(game_history), 6), figsize=(18, 3))
+        if len(game_history) == 1:
+            axes = [axes]
+        elif len(game_history) > 6:
+            # 如果超過6步，只顯示關鍵步數
+            indices = [0, len(game_history)//4, len(game_history)//2, 3*len(game_history)//4, len(game_history)-1]
+            game_history = [game_history[i] for i in indices if i < len(game_history)]
+            axes = axes[:len(game_history)]
+        
+        fig.suptitle(f'🎮 ConnectX 對戰: {agent1_name} vs {agent2_name}\n結果: {final_result}', 
+                    fontsize=14, fontweight='bold')
+        
+        colors = {0: 'white', 1: 'red', 2: 'blue'}
+        player_names = {1: agent1_name, 2: agent2_name}
+        
+        for idx, (ax, board_state) in enumerate(zip(axes, game_history)):
+            # 轉換為6x7矩陣
+            board_matrix = np.array(board_state).reshape(6, 7)
+            
+            # 創建顏色映射
+            board_colors = np.zeros((6, 7, 3))
+            for i in range(6):
+                for j in range(7):
+                    if board_matrix[i, j] == 1:
+                        board_colors[i, j] = [1, 0.3, 0.3]  # 紅色
+                    elif board_matrix[i, j] == 2:
+                        board_colors[i, j] = [0.3, 0.3, 1]  # 藍色
+                    else:
+                        board_colors[i, j] = [0.95, 0.95, 0.95]  # 淺灰色
+            
+            ax.imshow(board_colors)
+            
+            # 添加網格
+            for i in range(7):
+                ax.axvline(i - 0.5, color='black', linewidth=1)
+            for i in range(6):
+                ax.axhline(i - 0.5, color='black', linewidth=1)
+            
+            # 添加標題
+            if idx == 0:
+                ax.set_title('初始狀態', fontsize=10)
+            elif idx == len(game_history) - 1:
+                ax.set_title('最終狀態', fontsize=10)
+            else:
+                step_num = idx if len(game_history) <= 6 else [0, len(game_history)//4, len(game_history)//2, 3*len(game_history)//4, len(game_history)-1][idx]
+                ax.set_title(f'第 {step_num} 步', fontsize=10)
+            
+            ax.set_xticks([])
+            ax.set_yticks([])
+        
+        # 添加圖例
+        legend_elements = [
+            patches.Patch(color=[1, 0.3, 0.3], label=f'{agent1_name} (紅)'),
+            patches.Patch(color=[0.3, 0.3, 1], label=f'{agent2_name} (藍)')
+        ]
+        fig.legend(handles=legend_elements, loc='lower center', ncol=2)
+        
+        plt.tight_layout()
+        
+        # 保存或顯示
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            logger.info(f"遊戲可視化已保存: {save_path}")
+        else:
+            # 創建保存目錄
+            os.makedirs('game_visualizations', exist_ok=True)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            save_path = f'game_visualizations/game_{agent1_name}_vs_{agent2_name}_{timestamp}.png'
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            logger.info(f"遊戲可視化已保存: {save_path}")
+        
+        plt.close()
+
+    def demo_game_with_visualization(self, episode_num):
+        """每100個episode進行一次可視化演示"""
+        if not VISUALIZATION_AVAILABLE:
+            return
+        
+        logger.info(f"🎬 Episode {episode_num}: 開始可視化演示")
+        
+        # 根據當前訓練階段選擇不同的對手
+        if episode_num < 500:
+            # 早期：主要對抗隨機對手
+            opponent_types = ["隨機對手", "簡單Minimax"]
+            weights = [0.7, 0.3]
+        elif episode_num < 2000:
+            # 中期：混合對手
+            opponent_types = ["隨機對手", "Minimax", "自對弈"]
+            weights = [0.4, 0.4, 0.2]
+        else:
+            # 後期：主要自對弈和高級對手
+            opponent_types = ["Minimax", "自對弈"]
+            weights = [0.6, 0.4]
+        
+        # 隨機選擇對手類型
+        opponent_type = np.random.choice(opponent_types, p=weights)
+        
+        # 訓練中的智能體
+        def trained_agent(state, valid_actions, training=False):
+            return self.agent.select_action(state, valid_actions, training=training)
+        
+        # 根據選擇創建對手
+        if opponent_type == "隨機對手":
+            def opponent(state, valid_actions, training=False):
+                action = np.random.choice(valid_actions)
+                return action, 1.0 / len(valid_actions), 0.0
+            opponent_name = "Random"
+            
+        elif opponent_type == "簡單Minimax" or opponent_type == "Minimax":
+            def opponent(state, valid_actions, training=False):
+                # 從狀態重建棋盤
+                board = [0] * 42
+                # 這裡需要從編碼狀態重建，簡化處理
+                action = np.random.choice(valid_actions)  # 簡化版本
+                return action, 1.0, 0.0
+            opponent_name = "Minimax"
+            
+        else:  # 自對弈
+            def opponent(state, valid_actions, training=False):
+                return self.agent.select_action(state, valid_actions, training=training)
+            opponent_name = "Self-Play"
+        
+        # 隨機決定誰先手
+        if np.random.random() < 0.5:
+            agent1_func, agent1_name = trained_agent, "PPO-Agent"
+            agent2_func, agent2_name = opponent, opponent_name
+        else:
+            agent1_func, agent1_name = opponent, opponent_name
+            agent2_func, agent2_name = trained_agent, "PPO-Agent"
+        
+        # 執行可視化
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        save_path = f'game_visualizations/episode_{episode_num}_{agent1_name}_vs_{agent2_name}_{timestamp}.png'
+        
+        result = self.visualize_game(agent1_func, agent2_func, agent1_name, agent2_name, save_path)
+        
+        logger.info(f"🎯 Episode {episode_num} 演示完成: {agent1_name} vs {agent2_name} - {result}")
 
     def save_checkpoint(self, filename):
         """保存檢查點"""
