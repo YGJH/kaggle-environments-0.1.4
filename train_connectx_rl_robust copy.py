@@ -313,28 +313,6 @@ class PPOAgent:
 
         return encoded
 
-    def decode_state(self, encoded_state):
-        """從編碼狀態重建棋盤"""
-        try:
-            # 編碼狀態有126個元素，分為三個42元素的通道
-            if len(encoded_state) != 126:
-                raise ValueError(f"編碼狀態長度錯誤: {len(encoded_state)}")
-            
-            # 提取三個通道
-            player_pieces = encoded_state[:42].reshape(6, 7)
-            opponent_pieces = encoded_state[42:84].reshape(6, 7)
-            empty_spaces = encoded_state[84:126].reshape(6, 7)
-            
-            # 重建棋盤
-            board = np.zeros((6, 7), dtype=int)
-            board[player_pieces == 1] = 1  # 假設當前玩家是1
-            board[opponent_pieces == 1] = 2  # 對手是2
-            
-            return board.tolist()
-        except Exception as e:
-            logger.warning(f"狀態解碼失敗: {e}，返回空棋盤")
-            return [[0 for _ in range(7)] for _ in range(6)]
-
     def get_valid_actions(self, board):
         """獲取有效動作"""
         # 確保 board 是有效的
@@ -1314,160 +1292,6 @@ class ConnectXTrainer:
             return True
         return False
 
-    def analyze_tactical_patterns(self, board, action, player_id):
-        """
-        分析戰術模式並計算獎勵修正
-        """
-        tactical_bonus = 0.0
-        
-        # 檢查是否形成威脅（三子一線）
-        threat_bonus = self.check_threat_creation(board, action, player_id)
-        if threat_bonus > 0:
-            tactical_bonus += threat_bonus
-            
-        # 檢查是否阻擋對手威脅
-        block_bonus = self.check_threat_blocking(board, action, player_id)
-        if block_bonus > 0:
-            tactical_bonus += block_bonus
-            
-        # 檢查是否形成雙威脅
-        double_threat_bonus = self.check_double_threat(board, action, player_id)
-        if double_threat_bonus > 0:
-            tactical_bonus += double_threat_bonus
-            
-        # 檢查中心控制
-        center_bonus = self.check_center_control(board, action)
-        tactical_bonus += center_bonus
-        
-        return tactical_bonus
-
-    def check_threat_creation(self, board, action, player_id):
-        """檢查是否創造威脅（三子一線）"""
-        # 模擬放置棋子
-        temp_board = [row[:] for row in board]
-        for row in range(5, -1, -1):  # 從底部開始
-            if temp_board[row][action] == 0:
-                temp_board[row][action] = player_id
-                break
-        else:
-            return 0.0
-            
-        # 檢查是否形成三子一線
-        if self.has_three_in_row(temp_board, player_id):
-            return 8.0  # 創造威脅獎勵
-        return 0.0
-
-    def check_threat_blocking(self, board, action, player_id):
-        """檢查是否阻擋對手威脅"""
-        opponent_id = 3 - player_id  # 1->2, 2->1
-        
-        # 模擬對手在此位置放棋
-        temp_board = [row[:] for row in board]
-        for row in range(5, -1, -1):
-            if temp_board[row][action] == 0:
-                temp_board[row][action] = opponent_id
-                break
-        else:
-            return 0.0
-            
-        # 檢查對手是否能形成四子一線（即將獲勝）
-        if self.has_four_in_row(temp_board, opponent_id):
-            return 12.0  # 阻擋獲勝獎勵
-        elif self.has_three_in_row(temp_board, opponent_id):
-            return 6.0   # 阻擋威脅獎勵
-        return 0.0
-
-    def check_double_threat(self, board, action, player_id):
-        """檢查是否形成雙威脅"""
-        temp_board = [row[:] for row in board]
-        for row in range(5, -1, -1):
-            if temp_board[row][action] == 0:
-                temp_board[row][action] = player_id
-                break
-        else:
-            return 0.0
-            
-        # 計算可能的獲勝位置數量
-        winning_moves = 0
-        for col in range(7):
-            test_board = [row[:] for row in temp_board]
-            for test_row in range(5, -1, -1):
-                if test_board[test_row][col] == 0:
-                    test_board[test_row][col] = player_id
-                    if self.has_four_in_row(test_board, player_id):
-                        winning_moves += 1
-                    break
-                    
-        if winning_moves >= 2:
-            return 15.0  # 雙威脅超高獎勵
-        return 0.0
-
-    def check_center_control(self, board, action):
-        """檢查中心控制獎勵"""
-        center_cols = [2, 3, 4]  # 中心列
-        if action in center_cols:
-            return 1.0  # 中心控制小獎勵
-        return 0.0
-
-    def has_three_in_row(self, board, player_id):
-        """檢查是否有三子一線"""
-        for row in range(6):
-            for col in range(7):
-                if board[row][col] == player_id:
-                    # 檢查四個方向
-                    directions = [(0,1), (1,0), (1,1), (1,-1)]
-                    for dr, dc in directions:
-                        count = 1
-                        empty_ends = 0
-                        
-                        # 正方向檢查
-                        r, c = row + dr, col + dc
-                        while 0 <= r < 6 and 0 <= c < 7:
-                            if board[r][c] == player_id:
-                                count += 1
-                            elif board[r][c] == 0:
-                                empty_ends += 1
-                                break
-                            else:
-                                break
-                            r += dr
-                            c += dc
-                            
-                        # 負方向檢查
-                        r, c = row - dr, col - dc
-                        while 0 <= r < 6 and 0 <= c < 7:
-                            if board[r][c] == player_id:
-                                count += 1
-                            elif board[r][c] == 0:
-                                empty_ends += 1
-                                break
-                            else:
-                                break
-                            r -= dr
-                            c -= dc
-                            
-                        if count == 3 and empty_ends > 0:
-                            return True
-        return False
-
-    def has_four_in_row(self, board, player_id):
-        """檢查是否有四子一線（獲勝）"""
-        for row in range(6):
-            for col in range(7):
-                if board[row][col] == player_id:
-                    directions = [(0,1), (1,0), (1,1), (1,-1)]
-                    for dr, dc in directions:
-                        count = 1
-                        for direction in [1, -1]:
-                            r, c = row + direction*dr, col + direction*dc
-                            while 0 <= r < 6 and 0 <= c < 7 and board[r][c] == player_id:
-                                count += 1
-                                r += direction*dr
-                                c += direction*dc
-                        if count >= 4:
-                            return True
-        return False
-
     def play_game(self, agent1_func, agent2_func, training=True, training_player=None):
         """進行一場遊戲
         
@@ -1591,28 +1415,10 @@ class ConnectXTrainer:
             except KeyError:
                 reward = -5  # 異常情況給小懲罰
 
-            # 分配獎勵給轉換（加入戰術分析和位置獎勵）
+            # 分配獎勵給轉換（加入位置獎勵和危險動作懲罰）
             for i, transition in enumerate(episode_transitions):
                 # 基礎獎勵
                 shaped_reward = reward
-
-                # 戰術獎勵分析
-                try:
-                    # 需要從狀態重建棋盤
-                    board = self.agent.decode_state(transition['state'])
-                    training_player_id = transition.get('training_player', 1)
-                    
-                    # 計算戰術獎勵
-                    tactical_bonus = self.analyze_tactical_patterns(
-                        board, transition['action'], training_player_id
-                    )
-                    shaped_reward += tactical_bonus
-                    
-                    if tactical_bonus > 0:
-                        logger.debug(f"戰術獎勵 +{tactical_bonus:.1f} (動作: {transition['action']})")
-                        
-                except Exception as e:
-                    logger.debug(f"戰術分析失敗: {e}")
 
                 # 危險動作懲罰
                 if transition.get('is_dangerous', False):
@@ -1624,18 +1430,9 @@ class ConnectXTrainer:
                 position_weight = (i + 1) / game_length
                 shaped_reward = shaped_reward * (0.5 + 0.5 * position_weight)
 
-                # 探索獎勵調整：減少隨機性，增強戰術導向
-                if i % 5 == 0:  # 降低探索獎勵頻率
-                    exploration_bonus = 5  # 減少探索獎勵幅度
-                    shaped_reward += exploration_bonus
-
-                # 應用配置中的獎勵縮放
-                if 'win_reward_scaling' in self.config.get('training', {}):
-                    if shaped_reward > 0:
-                        shaped_reward *= self.config['training']['win_reward_scaling']
-                if 'loss_penalty_scaling' in self.config.get('training', {}):
-                    if shaped_reward < 0:
-                        shaped_reward *= self.config['training']['loss_penalty_scaling']
+                # 添加小的探索獎勵（鼓勵嘗試不同策略）
+                exploration_bonus = 10 if i % 3 == 0 else 0
+                shaped_reward += exploration_bonus
 
                 self.agent.store_transition(
                     transition['state'],
@@ -2148,58 +1945,35 @@ class ConnectXTrainer:
         return False
 
     def _select_training_strategy(self, episode):
-        """動態選擇訓練策略以打破收斂停滯和增強戰術學習"""
+        """動態選擇訓練策略以打破收斂停滯"""
         # 基於episode數量和性能動態調整訓練策略
         recent_win_rate = np.mean(self.win_rates[-5:]) if len(self.win_rates) >= 5 else 0.5
         
-        # 檢查是否啟用戰術重點訓練
-        tactical_focus = self.config.get('training', {}).get('tactical_focus', False)
-        
-        # 早期階段（0-10000）：建立基本技能，增強戰術
+        # 早期階段（0-10000）：建立基本技能
         if episode < 10000:
-            if tactical_focus:
-                strategies = ['tactical_opponent', 'diverse_opponent', 'submission_opponent', 'tactical_challenge']
-                probabilities = [0.4, 0.25, 0.2, 0.15]  # 加重戰術訓練
-            else:
+            strategies = ['diverse_opponent', 'tactical_opponent', 'submission_opponent', 'standard']
+            probabilities = [0.3, 0.3, 0.2, 0.2]
+        
+        # 中期階段（10000-50000）：策略多樣化
+        elif episode < 50000:
+            if recent_win_rate > 0.8:  # 表現太好，需要更多挑戰
+                strategies = ['curriculum_self_play', 'exploration_enhanced', 'submission_opponent', 'noise_injection', 'tactical_opponent']
+                probabilities = [0.25, 0.25, 0.2, 0.15, 0.15]
+            else:  # 表現一般，平衡訓練
+                strategies = ['diverse_opponent', 'tactical_opponent', 'submission_opponent', 'exploration_enhanced', 'standard']
+                probabilities = [0.25, 0.25, 0.2, 0.15, 0.15]
+        
+        # 後期階段（50000+）：高級策略優化
+        else:
+            if recent_win_rate < 0.4:  # 表現下降，回到基礎訓練
                 strategies = ['diverse_opponent', 'tactical_opponent', 'submission_opponent', 'standard']
                 probabilities = [0.3, 0.3, 0.2, 0.2]
-        
-        # 中期階段（10000-50000）：策略多樣化，重點戰術
-        elif episode < 50000:
-            if recent_win_rate > 0.8:  # 表現太好，增加挑戰
-                if tactical_focus:
-                    strategies = ['tactical_challenge', 'curriculum_self_play', 'exploration_enhanced', 'tactical_opponent', 'submission_opponent']
-                    probabilities = [0.3, 0.2, 0.2, 0.2, 0.1]
-                else:
-                    strategies = ['curriculum_self_play', 'exploration_enhanced', 'submission_opponent', 'noise_injection', 'tactical_opponent']
-                    probabilities = [0.25, 0.25, 0.2, 0.15, 0.15]
-            else:  # 表現一般，加強戰術訓練
-                if tactical_focus:
-                    strategies = ['tactical_opponent', 'diverse_opponent', 'tactical_challenge', 'submission_opponent', 'exploration_enhanced']
-                    probabilities = [0.35, 0.2, 0.2, 0.15, 0.1]
-                else:
-                    strategies = ['diverse_opponent', 'tactical_opponent', 'submission_opponent', 'exploration_enhanced', 'standard']
-                    probabilities = [0.25, 0.25, 0.2, 0.15, 0.15]
-        
-        # 後期階段（50000+）：高級戰術優化
-        else:
-            if recent_win_rate < 0.4:  # 表現下降，回到基礎戰術訓練
-                if tactical_focus:
-                    strategies = ['tactical_opponent', 'diverse_opponent', 'tactical_challenge', 'submission_opponent']
-                    probabilities = [0.4, 0.25, 0.2, 0.15]
-                else:
-                    strategies = ['diverse_opponent', 'tactical_opponent', 'submission_opponent', 'standard']
-                    probabilities = [0.3, 0.3, 0.2, 0.2]
-            elif recent_win_rate > 0.9:  # 過度收斂，強制戰術多樣化
-                strategies = ['tactical_challenge', 'curriculum_self_play', 'exploration_enhanced', 'submission_opponent']
-                probabilities = [0.35, 0.25, 0.25, 0.15]
-            else:  # 正常情況，均衡戰術策略
-                if tactical_focus:
-                    strategies = ['tactical_opponent', 'tactical_challenge', 'curriculum_self_play', 'exploration_enhanced', 'submission_opponent']
-                    probabilities = [0.3, 0.25, 0.2, 0.15, 0.1]
-                else:
-                    strategies = ['curriculum_self_play', 'exploration_enhanced', 'submission_opponent', 'diverse_opponent', 'tactical_opponent']
-                    probabilities = [0.2, 0.2, 0.2, 0.2, 0.2]
+            elif recent_win_rate > 0.9:  # 過度收斂，強制多樣化
+                strategies = ['curriculum_self_play', 'exploration_enhanced', 'submission_opponent', 'noise_injection']
+                probabilities = [0.3, 0.3, 0.2, 0.2]
+            else:  # 正常情況，均衡策略
+                strategies = ['curriculum_self_play', 'exploration_enhanced', 'submission_opponent', 'diverse_opponent', 'tactical_opponent']
+                probabilities = [0.2, 0.2, 0.2, 0.2, 0.2]
         
         return np.random.choice(strategies, p=probabilities)
 
@@ -2787,147 +2561,6 @@ class ConnectXTrainer:
 
         reward, episode_length = self.play_game(trained_agent, random_agent, training=True, training_player=2)
         return reward, episode_length
-
-    def tactical_challenge_episode(self):
-        """戰術挑戰訓練 - 高強度戰術對手"""
-        
-        # 創建訓練中的智能體函數
-        def trained_agent(state, valid_actions, training):
-            return self.agent.select_action(state, valid_actions, training)
-        
-        # 創建超強戰術對手（結合多種戰術）
-        def super_tactical_opponent(state, valid_actions, training):
-            try:
-                board, mark = self.agent.safe_decode_board_and_player(state)
-                
-                # 1. 優先檢查立即獲勝
-                winning_move = self.if_i_can_finish(board, mark, valid_actions)
-                if winning_move != -1:
-                    return winning_move, 1.0, 0.0
-                
-                # 2. 檢查是否需要阻擋對手獲勝
-                blocking_move = self.if_i_will_lose(board, mark, valid_actions)
-                if blocking_move != -1:
-                    return blocking_move, 1.0, 0.0
-                
-                # 3. 檢查是否能創造雙威脅
-                double_threat_move = self.find_double_threat_move(board, mark, valid_actions)
-                if double_threat_move != -1:
-                    return double_threat_move, 1.0, 0.0
-                
-                # 4. 尋找最佳戰術位置
-                best_tactical_move = self.find_best_tactical_move(board, mark, valid_actions)
-                if best_tactical_move != -1:
-                    return best_tactical_move, 1.0, 0.0
-                
-                # 5. 使用minimax作為後備
-                try:
-                    best_action = self.minimax_agent(board, mark, valid_actions, depth=6)
-                    return best_action, 1.0, 0.0
-                except:
-                    pass
-                
-                # 6. 最後退到安全動作
-                safe_actions, _ = self.filter_safe_actions(board, mark, valid_actions)
-                if safe_actions:
-                    return random.choice(safe_actions), 1.0, 0.0
-                else:
-                    return random.choice(valid_actions), 1.0, 0.0
-                    
-            except Exception as e:
-                logger.debug(f"戰術挑戰對手出錯: {e}")
-                return random.choice(valid_actions), 1.0, 0.0
-        
-        # 隨機決定誰作為超強對手
-        if random.random() < 0.5:
-            reward, episode_length = self.play_game(trained_agent, super_tactical_opponent, training=True, training_player=1)
-        else:
-            reward, episode_length = self.play_game(super_tactical_opponent, trained_agent, training=True, training_player=2)
-        
-        return reward, episode_length
-
-    def find_double_threat_move(self, board, mark, valid_actions):
-        """尋找能創造雙威脅的動作"""
-        for action in valid_actions:
-            temp_board = [row[:] for row in board]
-            # 模擬放置棋子
-            for row in range(5, -1, -1):
-                if temp_board[row][action] == 0:
-                    temp_board[row][action] = mark
-                    break
-            else:
-                continue
-            
-            # 檢查是否創造了雙威脅
-            winning_moves = 0
-            for col in range(7):
-                test_board = [row[:] for row in temp_board]
-                for test_row in range(5, -1, -1):
-                    if test_board[test_row][col] == 0:
-                        test_board[test_row][col] = mark
-                        if self.has_four_in_row(test_board, mark):
-                            winning_moves += 1
-                        break
-            
-            if winning_moves >= 2:
-                return action
-        
-        return -1
-
-    def find_best_tactical_move(self, board, mark, valid_actions):
-        """尋找最佳戰術動作（創造威脅、控制中心等）"""
-        best_score = -1
-        best_action = -1
-        
-        for action in valid_actions:
-            score = 0
-            temp_board = [row[:] for row in board]
-            
-            # 模擬放置棋子
-            for row in range(5, -1, -1):
-                if temp_board[row][action] == 0:
-                    temp_board[row][action] = mark
-                    break
-            else:
-                continue
-            
-            # 評分標準
-            # 1. 創造三子一線威脅
-            if self.has_three_in_row(temp_board, mark):
-                score += 50
-            
-            # 2. 中心控制
-            if action in [2, 3, 4]:
-                score += 10
-            
-            # 3. 連接現有棋子
-            adjacent_count = self.count_adjacent_pieces(temp_board, action, mark)
-            score += adjacent_count * 5
-            
-            if score > best_score:
-                best_score = score
-                best_action = action
-        
-        return best_action if best_score > 0 else -1
-
-    def count_adjacent_pieces(self, board, col, mark):
-        """計算指定列周圍的己方棋子數量"""
-        count = 0
-        for row in range(5, -1, -1):
-            if board[row][col] == mark:
-                row_pos = row
-                break
-        else:
-            return 0
-        
-        # 檢查周圍8個方向
-        directions = [(-1,-1), (-1,0), (-1,1), (0,-1), (0,1), (1,-1), (1,0), (1,1)]
-        for dr, dc in directions:
-            r, c = row_pos + dr, col + dc
-            if 0 <= r < 6 and 0 <= c < 7 and board[r][c] == mark:
-                count += 1
-        
-        return count
 
     def play_against_tactical_opponent(self):
         """對抗戰術對手的訓練回合"""
@@ -3586,9 +3219,6 @@ class ConnectXTrainer:
                 elif training_strategy == 'tactical_opponent':
                     # 戰術對手訓練
                     reward, episode_length = self.enhanced_self_play_episode()
-                elif training_strategy == 'tactical_challenge':
-                    # 戰術挑戰訓練 - 新增的高難度戰術訓練
-                    reward, episode_length = self.tactical_challenge_episode()
                 elif training_strategy == 'submission_opponent':
                     # 對抗submission.py中的agent
                     reward, episode_length = self.play_against_submission_agent()
@@ -4572,7 +4202,7 @@ def create_default_config():
 
 def main():
     config_path = 'config.yaml'
-    load = 'checkpoints/checkpoint_episode_150000.pt'
+    load = 'checkpoints/checkpoint_episode_140000.pt'
     # load = False
 
     pretrain_epochs = 1

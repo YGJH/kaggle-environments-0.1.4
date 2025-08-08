@@ -5,7 +5,7 @@ import base64
 import pickle
 
 # 載入模型
-checkpoint = torch.load("checkpoints/checkpoint_episode_50000.pt", map_location="cpu")
+checkpoint = torch.load("checkpoints/checkpoint_episode_140000.pt", map_location="cpu")
 state_dict = checkpoint['model_state_dict']
 
 # 存成 numpy
@@ -161,10 +161,35 @@ def forward_pass(state):
     policy = policy_exp / np.sum(policy_exp)
     
     return policy
+# 全局變量用於遊戲計數
+_game_count = 0
+
+def detect_player_identity(board, mark):
+    """通過統計棋盤上的棋子數量來確定當前玩家身份"""
+    # 統計棋盤上1和2的棋子數量
+    count_1 = sum(1 for cell in board if cell == 1)
+    count_2 = sum(1 for cell in board if cell == 2)
+    
+    # 如果棋盤為空或1的數量等於2的數量，當前玩家是1（先手）
+    # 如果1的數量比2多1個，當前玩家是2（後手）
+    if count_1 == count_2:
+        current_player = 1  # 先手玩家的回合
+    elif count_1 == count_2 + 1:
+        current_player = 2  # 後手玩家的回合
+    else:
+        # 異常情況，使用傳入的mark
+        current_player = mark
+    
+    # 返回檢測到的當前玩家
+    return current_player
+
 def encode_state(board, mark):
+    # 使用簡化的玩家身份檢測
+    current_player = detect_player_identity(board, mark)
+    
     state = np.array(board).reshape(6, 7)
-    player_pieces = (state == mark).astype(np.float32)
-    opponent_pieces = (state == (3 - mark)).astype(np.float32)
+    player_pieces = (state == current_player).astype(np.float32)
+    opponent_pieces = (state == (3 - current_player)).astype(np.float32)
     empty_spaces = (state == 0).astype(np.float32)
     encoded = np.concatenate([
         player_pieces.flatten(),
@@ -172,11 +197,19 @@ def encode_state(board, mark):
         empty_spaces.flatten()
     ])
     return encoded
+
 def get_valid_actions(board):
     return [col for col in range(7) if board[col] == 0]
+
 def my_agent(obs, config):
+    global _game_count
     board = obs['board']
     mark = obs['mark']
+    
+    # 增加遊戲計數
+    total_pieces = sum(1 for cell in board if cell != 0)
+    if total_pieces == 0:  # 新遊戲開始
+        _game_count += 1
     
     # 首先檢查是否可以直接獲勝
     winning_move = if_i_can_finish(board, mark)
