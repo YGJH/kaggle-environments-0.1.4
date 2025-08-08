@@ -75,7 +75,9 @@ def _worker_collect_episode(args):
         # Force CPU in worker to avoid CUDA context sharing issues
         os.environ.setdefault('CUDA_VISIBLE_DEVICES', '')
         cfg = args['config']
-        policy_state = args['policy_state']
+        # Rebuild torch tensors from numpy to avoid torch shared memory pickling
+        policy_state_np = args['policy_state']
+        policy_state = {k: (torch.from_numpy(v) if isinstance(v, np.ndarray) else v) for k, v in policy_state_np.items()}
         player2_prob = args.get('player2_training_prob', 0.7)
         use_tactical_opp = bool(args.get('use_tactical_opponent', False))
         seed = args.get('seed', None)
@@ -1340,6 +1342,14 @@ class ConnectXTrainer:
         loss_scale = float(training_cfg.get('loss_penalty_scaling', 1.0))
         danger_scale = float(self.config.get('agent', {}).get('tactical_bonus', 0.1))
         min_batch_size = int(self.agent.config.get('min_batch_size', 512))
+        visualize_every = int(training_cfg.get('visualize_every', 10))
+
+        # Use spawn to reduce fd/shm issues; reuse a persistent pool
+        try:
+            mp_ctx = mp.get_context('spawn')
+        except ValueError:
+            mp_ctx = mp
+        pool = mp_ctx.Pool(processes=num_workers, maxtasksperchild=8)
 
         rng = random.Random()
         best_score = -1.0
@@ -1348,96 +1358,258 @@ class ConnectXTrainer:
 
         logger.info(f"🚀 啟動平行訓練：workers={num_workers}, episodes_per_update={episodes_per_update}")
 
-        def _collect_batch(policy_state_cpu, n_episodes: int):
+        def _collect_batch(policy_state_numpy, n_episodes: int):
             args = []
             for i in range(n_episodes):
                 use_tac = use_tactical_opp and (rng.random() < tactical_ratio)
                 args.append({
                     'config': self.config,
-                    'policy_state': policy_state_cpu,
+                    'policy_state': policy_state_numpy,
                     'player2_training_prob': self.player2_training_prob,
                     'use_tactical_opponent': use_tac,
                     'seed': rng.randrange(2**31 - 1),
                 })
-            with mp.Pool(processes=num_workers) as pool:
-                results = pool.map(_worker_collect_episode, args)
+            results = pool.map(_worker_collect_episode, args)
             return results
 
-        while episodes_done_total < max_episodes:
-            # 將模型權重搬到 CPU 供工作者複製
-            policy_state_cpu = {k: v.detach().cpu() for k, v in self.agent.policy_net.state_dict().items()}
+        try:
+            while episodes_done_total < max_episodes:
+                # 將模型權重轉成 numpy，避免 torch 在多進程中使用共享記憶體/FD
+                policy_state_numpy = {k: v.detach().cpu().numpy() for k, v in self.agent.policy_net.state_dict().items()}
 
-            results = _collect_batch(policy_state_cpu, episodes_per_update)
-            collected_eps = 0
+                results = _collect_batch(policy_state_numpy, episodes_per_update)
+                collected_eps = 0
 
-            for res in results:
-                transitions = res.get('transitions', [])
-                if not transitions:
-                    continue
-                player_result = int(res.get('player_result', 0))  # 1/0/-1
-                ep_reward_sum = 0.0
-                last_idx = len(transitions) - 1
-                for idx, tr in enumerate(transitions):
-                    state = tr['state']
-                    action = int(tr['action'])
-                    prob = float(tr['prob'])
-                    reward = 0.0
-                    # 結束時給最終勝負回饋
-                    if idx == last_idx:
-                        if player_result == 1:
-                            reward += 1.0 * win_scale
-                        elif player_result == -1:
-                            reward -= 1.0 * loss_scale
-                        else:
-                            reward += 0.0
-                    # 危險步懲罰（來自 worker 的快速戰術檢查）
-                    if tr.get('is_dangerous', False):
-                        reward += -10.0 * danger_scale
-                    ep_reward_sum += reward
-                    done = (idx == last_idx)
-                    self.agent.store_transition(state, action, prob, reward, done)
-                self.episode_rewards.append(ep_reward_sum)
-                collected_eps += 1
+                for res in results:
+                    transitions = res.get('transitions', [])
+                    if not transitions:
+                        continue
+                    player_result = int(res.get('player_result', 0))  # 1/0/-1
+                    ep_reward_sum = 0.0
+                    last_idx = len(transitions) - 1
+                    for idx, tr in enumerate(transitions):
+                        state = tr['state']
+                        action = int(tr['action'])
+                        prob = float(tr['prob'])
+                        reward = 0.0
+                        # 結束時給最終勝負回饋
+                        if idx == last_idx:
+                            if player_result == 1:
+                                reward += 1.0 * win_scale
+                            elif player_result == -1:
+                                reward += -1.0 * loss_scale
+                            else:
+                                reward += 0.0
+                        # 危險步懲罰（來自 worker 的快速戰術檢查）
+                        if tr.get('is_dangerous', False):
+                            reward += -10.0 * danger_scale
+                        ep_reward_sum += reward
+                        done = (idx == last_idx)
+                        self.agent.store_transition(state, action, prob, reward, done)
+                    self.episode_rewards.append(ep_reward_sum)
+                    collected_eps += 1
 
-            episodes_done_total += collected_eps
+                episodes_done_total += collected_eps
 
-            # 當緩衝足夠大時才更新 PPO
-            if len(self.agent.memory) >= min_batch_size:
-                info = self.agent.update_policy()
-                if info is not None:
-                    self.training_losses.append(info.get('total_loss', 0.0))
+                # 當緩衝足夠大時才更新 PPO
+                if len(self.agent.memory) >= min_batch_size:
+                    info = self.agent.update_policy()
+                    if info is not None:
+                        self.training_losses.append(info.get('total_loss', 0.0))
 
-            # 週期性評估
-            if eval_frequency > 0 and episodes_done_total % eval_frequency == 0:
-                metrics = self.evaluate_comprehensive(games=eval_games)
-                score = float(metrics.get('comprehensive_score', 0.0))
-                self.win_rates.append(score)
-                # 調度學習率（以評估分數為目標）
-                try:
-                    self.agent.scheduler.step(score)
-                except Exception:
-                    pass
-                logger.info(
-                    f"📈 Eps={episodes_done_total} | Score={score:.3f} | "
-                    f"self={metrics.get('self_play', 0):.3f} minimax={metrics.get('vs_minimax', 0):.3f} rand={metrics.get('vs_random', 0):.3f}"
-                )
-                # 偵測停滯
-                try:
-                    if self._detect_convergence_stagnation(episodes_done_total, score):
-                        self._handle_convergence_stagnation(episodes_done_total)
-                except Exception:
-                    pass
-                # 更新最佳模型
-                if score > best_score:
-                    best_score = score
-                    self.save_checkpoint(f"best_model_wr_{best_score:.3f}.pt")
+                # 週期性評估
+                if eval_frequency > 0 and episodes_done_total % eval_frequency == 0:
+                    metrics = self.evaluate_comprehensive(games=eval_games)
+                    score = float(metrics.get('comprehensive_score', 0.0))
+                    self.win_rates.append(score)
+                    # 調度學習率（以評估分數為目標）
+                    try:
+                        self.agent.scheduler.step(score)
+                    except Exception:
+                        pass
+                    logger.info(
+                        f"📈 Eps={episodes_done_total} | Score={score:.3f} | "
+                        f"self={metrics.get('self_play', 0):.3f} minimax={metrics.get('vs_minimax', 0):.3f} rand={metrics.get('vs_random', 0):.3f}"
+                    )
+                    # 偵測停滯
+                    try:
+                        if self._detect_convergence_stagnation(episodes_done_total, score):
+                            self._handle_convergence_stagnation(episodes_done_total)
+                    except Exception:
+                        pass
+                    # 更新最佳模型
+                    if score > best_score:
+                        best_score = score
+                        self.save_checkpoint(f"best_model_wr_{best_score:.3f}.pt")
 
-            # 週期性檢查點
-            if checkpoint_frequency > 0 and episodes_done_total % checkpoint_frequency == 0:
-                self.save_checkpoint(f"checkpoint_episode_{episodes_done_total}.pt")
+                # 週期性檢查點
+                if checkpoint_frequency > 0 and episodes_done_total % checkpoint_frequency == 0:
+                    self.save_checkpoint(f"checkpoint_episode_{episodes_done_total}.pt")
+
+                # 週期性可視化
+                if (
+                    visualize_every > 0 and
+                    episodes_done_total % visualize_every == 0
+                ):
+                    try:
+                        self.visualize_training_game(episodes_done_total, save_dir='videos', opponent='tactical', fps=2)
+                    except Exception as ve:
+                        logger.warning(f"可視化失敗：{ve}")
+        finally:
+            try:
+                pool.close()
+                pool.join()
+            except Exception:
+                pass
 
         logger.info("✅ 平行訓練完成")
         return self.agent
+
+    def _record_game_frames(self, opponent: str = 'tactical', max_moves: int = 50):
+        """遊玩一局並記錄每步的棋盤影格（6x7數組）。"""
+        frames = []
+        try:
+            env = make('connectx', debug=False)
+            env.reset()
+            moves = 0
+            with torch.no_grad():
+                # 記錄初始棋盤（若可）
+                try:
+                    board, _ = self.agent.extract_board_and_mark(env.state, 0)
+                    frames.append(self._flat_to_2d(board))
+                except Exception:
+                    pass
+                while not env.done and moves < max_moves:
+                    actions = []
+                    for p in range(2):
+                        if env.state[p]['status'] != 'ACTIVE':
+                            actions.append(0)
+                            continue
+                        board, mark = self.agent.extract_board_and_mark(env.state, p)
+                        valid = self.agent.get_valid_actions(board)
+                        if p == 0:
+                            # 我方用策略 + 安全檢查
+                            a = self._choose_policy_with_tactics(board, mark, valid, training=False)
+                        else:
+                            if opponent == 'tactical':
+                                a = self._random_with_tactics(board, mark, valid)
+                            elif opponent == 'minimax':
+                                a = self._choose_minimax_move(board, mark, max_depth=int(self.config.get('evaluation', {}).get('minimax_depth', 3)))
+                            else:
+                                # 純隨機
+                                a = random.choice(valid)
+                        actions.append(int(a))
+                    try:
+                        env.step(actions)
+                    except Exception:
+                        break
+                    moves += 1
+                    try:
+                        board, _ = self.agent.extract_board_and_mark(env.state, 0)
+                        frames.append(self._flat_to_2d(board))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return frames
+
+    def visualize_training_game(self, episode_idx: int, save_dir: str = 'videos', opponent: str = 'tactical', fps: int = 2):
+        """將一局可視化並輸出為影片（強制使用FFmpeg MP4）。返回輸出路徑或None。"""
+        if not globals().get('VISUALIZATION_AVAILABLE', False):
+            logger.info("未安裝可視化依賴，略過影片輸出。")
+            return None
+        try:
+            import matplotlib
+            import matplotlib.pyplot as plt
+            from matplotlib import animation
+            from matplotlib.patches import Patch
+            import shutil
+            # Configure ffmpeg path from system PATH. Force MP4 via FFmpeg.
+            ffmpeg_path = shutil.which('ffmpeg')
+            if not ffmpeg_path:
+                raise RuntimeError("ffmpeg not found in PATH. Please install ffmpeg to export MP4.")
+            matplotlib.rcParams['animation.ffmpeg_path'] = ffmpeg_path
+        except Exception as e:
+            logger.warning(f"載入matplotlib/ffmpeg失敗，略過影片輸出: {e}")
+            return None
+
+        frames = self._record_game_frames(opponent=opponent)
+        if not frames:
+            logger.info("無可視化影格，略過影片輸出。")
+            return None
+
+        # 讓最後一幀多停留一會（約2秒）
+        try:
+            hold_frames = max(1, int(fps * 2))  # 停留 2 秒
+            frames = frames + [frames[-1]] * hold_frames
+        except Exception:
+            pass
+
+        os.makedirs(save_dir, exist_ok=True)
+        # 優先MP4，否則GIF
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        mp4_path = os.path.join(save_dir, f"episode_{episode_idx}_{ts}.mp4")
+        gif_path = os.path.join(save_dir, f"episode_{episode_idx}_{ts}.gif")
+
+        # 畫布
+        fig, ax = plt.subplots(figsize=(5.6, 4.8))
+        ax.set_xlim(-0.5, 6.5)
+        ax.set_ylim(-0.5, 5.5)
+        ax.set_xticks(range(7))
+        ax.set_yticks(range(6))
+        ax.grid(True)
+        ax.set_title(f"Episode {episode_idx} vs {opponent}")
+
+        # 新增圖例說明顏色: 紅=Agent(P1), 金=Opponent(P2)
+        handles = [
+            Patch(color='red', label='Agent (P1)'),
+            Patch(color='gold', label='Opponent (P2)')
+        ]
+        ax.legend(handles=handles, loc='upper right', framealpha=0.9)
+
+        # 初始化圓片集合
+        discs = []
+        def draw_board(grid):
+            # 清除先前圓片
+            for d in discs:
+                d.remove()
+            discs.clear()
+            # 繪製棋子：grid[r][c] 1->紅, 2->黃
+            for r in range(6):
+                for c in range(7):
+                    v = grid[r][c]
+                    if v == 0:
+                        continue
+                    color = 'red' if v == 1 else 'gold'
+                    circle = plt.Circle((c, 5 - r), 0.4, color=color)
+                    ax.add_patch(circle)
+                    discs.append(circle)
+
+        def init():
+            draw_board(frames[0])
+            return discs
+
+        def update(i):
+            draw_board(frames[i])
+            return discs
+
+        anim = animation.FuncAnimation(fig, update, init_func=init, frames=len(frames), interval=int(1000 / max(1, fps)), blit=False)
+
+        out_path = None
+        # 強制使用 FFmpeg 輸出 MP4（如果失敗則不回退 GIF）
+        try:
+            writer = animation.FFMpegWriter(fps=fps, codec='mpeg4', bitrate=1800, extra_args=['-pix_fmt', 'yuv420p'])
+            anim.save(mp4_path, writer=writer)
+            out_path = mp4_path
+        except Exception as e:
+            logger.warning(f"使用FFmpeg輸出MP4失敗: {e}")
+            out_path = None
+        finally:
+            plt.close(fig)
+
+        if out_path:
+            logger.info(f"🎬 已輸出訓練對局影片: {out_path}")
+        return out_path
 def main():
     # 1) 準備 Trainer 與載入模型
     import os
@@ -1488,10 +1660,10 @@ def main():
     trainer = ConnectXTrainer(cfg_path)
 
     # 允許透過環境變數指定要載入的 checkpoint
-    resume_from_env = os.getenv("CHECKPOINT_PATH") or os.getenv("RESUME_FROM")
-    resume_from_cfg = trainer.config.get('training', {}).get('resume_from')
-    ckpt_to_load = resume_from_env or resume_from_cfg or find_latest_checkpoint()
-
+    # resume_from_env = os.getenv("CHECKPOINT_PATH") or os.getenv("RESUME_FROM")
+    # resume_from_cfg = trainer.config.get('training', {}).get('resume_from')
+    # ckpt_to_load = resume_from_env or resume_from_cfg or find_latest_checkpoint()
+    ckpt_to_load = 'checkpoints/final_20250808_114523.pt'  # 強制使用最佳模型檢查點
     if ckpt_to_load:
         loaded = trainer.load_checkpoint(ckpt_to_load)
         if not loaded:

@@ -34,6 +34,8 @@ connectx-rl-training/
 *.html
 sub/
 logs/
+videos/
+game_visualizations
 kaggle_environments/
 submission*.py
 **.npz
