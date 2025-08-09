@@ -78,14 +78,14 @@ def _worker_collect_episode(args):
         # Rebuild torch tensors from numpy to avoid torch shared memory pickling
         policy_state_np = args['policy_state']
         policy_state = {k: (torch.from_numpy(v) if isinstance(v, np.ndarray) else v) for k, v in policy_state_np.items()}
-        player2_prob = args.get('player2_training_prob', 0.7)
+        player2_prob = args.get('player2_training_prob', 0.5)
         use_tactical_opp = bool(args.get('use_tactical_opponent', False))
         seed = args.get('seed', None)
         if seed is not None:
             random.seed(seed)
             np.random.seed(seed)
             torch.manual_seed(seed)
-
+        print(f'player2_training_prob: {player2_training_prob}')
         # Create a minimal agent on CPU and load weights
         agent = PPOAgent(cfg['agent'])
         agent.device = torch.device('cpu')
@@ -228,65 +228,164 @@ def _worker_collect_episode(args):
             'error': str(e)
         }
 
+class DropPath(nn.Module):
+    """Stochastic Depth per sample (when training only)."""
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = float(max(0.0, drop_prob))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1.0 - self.drop_prob
+        # shape: (N, 1, 1, 1) for broadcasting
+        mask = torch.empty((x.shape[0], 1, 1, 1), dtype=x.dtype, device=x.device).bernoulli_(keep_prob)
+        return x.div(keep_prob) * mask
+
+
 class ConnectXNet(nn.Module):
-    """強化學習用的 ConnectX 深度神經網路"""
+    """Advanced ConnectX policy-value network.
+    Enhancements:
+      - Coordinate embedding (row/col planes)
+      - Wider channel width (128)
+      - Bottleneck residual blocks with Squeeze-and-Excitation (SE)
+      - Stochastic Depth (DropPath) per block
+      - Periodic lightweight spatial self-attention (every attn_every blocks)
+      - Shared trunk then dual heads (policy softmax, value tanh)
+    Input remains flat 126 (3x6x7); coord planes added internally (->5 channels) for compatibility.
+    """
 
-    def __init__(self, input_size=126, hidden_size=156, num_layers=256):
-        super(ConnectXNet, self).__init__()
+    def __init__(self, input_size=126, hidden_size=192, num_layers=256, drop_path_rate: float = 0.08, attn_every: int = 4):
+        super().__init__()
+        # Clamp depth
+        max_blocks = 32
+        blocks = int(num_layers) if isinstance(num_layers, int) else max_blocks
+        if blocks > max_blocks:
+            try:
+                logger.warning(f"num_layers={blocks} 過深，縮減為 {max_blocks}")
+            except Exception:
+                pass
+            blocks = max_blocks
+        self.blocks = blocks
+        self.channels = 128
+        self.drop_path_rate = float(max(0.0, drop_path_rate))
+        self.attn_every = max(0, int(attn_every))
 
-        # 輸入層
-        self.input_layer = nn.Sequential(
-            nn.Linear(input_size, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(0.1)
+        # Coordinate embedding (2,6,7)
+        row = torch.linspace(-1, 1, steps=6).unsqueeze(1).repeat(1, 7)
+        col = torch.linspace(-1, 1, steps=7).unsqueeze(0).repeat(6, 1)
+        coord = torch.stack([row, col], dim=0)  # (2,6,7)
+        self.register_buffer('coord_embed', coord)
+
+        in_ch = 3 + 2  # original planes + coord planes
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_ch, self.channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(8, self.channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(p=0.05),
         )
 
-        # 隱藏層（殘差連接 + 層正規化代替批量正規化）
-        self.hidden_layers = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(hidden_size, hidden_size),
-                nn.LayerNorm(hidden_size),  # 使用 LayerNorm 代替 BatchNorm1d
-                nn.ReLU(),
-                nn.Dropout(0.15),  # 稍微增加dropout
-                nn.Linear(hidden_size, hidden_size),
-                nn.LayerNorm(hidden_size)   # 使用 LayerNorm 代替 BatchNorm1d
-            ) for _ in range(num_layers)
-        ])
+        # --- Building blocks ---
+        class BottleneckSE(nn.Module):
+            def __init__(self, c, drop_path=0.0, reduction=4):
+                super().__init__()
+                mid = max(32, c // 2)
+                self.conv1 = nn.Conv2d(c, mid, 1, bias=False)
+                self.gn1 = nn.GroupNorm(8, mid)
+                self.conv2 = nn.Conv2d(mid, mid, 3, padding=1, bias=False)
+                self.gn2 = nn.GroupNorm(8, mid)
+                self.conv3 = nn.Conv2d(mid, c, 1, bias=False)
+                self.gn3 = nn.GroupNorm(8, c)
+                # SE
+                se_hidden = max(8, c // reduction)
+                self.se_fc1 = nn.Linear(c, se_hidden)
+                self.se_fc2 = nn.Linear(se_hidden, c)
+                self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+                self.act = nn.ReLU(inplace=True)
+            def forward(self, x):
+                identity = x
+                out = self.act(self.gn1(self.conv1(x)))
+                out = self.act(self.gn2(self.conv2(out)))
+                out = self.gn3(self.conv3(out))
+                # Squeeze Excitation
+                w = out.mean(dim=[2,3])          # (B,C)
+                w = self.act(self.se_fc1(w))
+                w = torch.sigmoid(self.se_fc2(w)).unsqueeze(-1).unsqueeze(-1)  # (B,C,1,1)
+                out = out * w
+                out = self.drop_path(out)
+                out = self.act(out + identity)
+                return out
 
-        # 策略頭（動作概率）
+        class SpatialSelfAttention(nn.Module):
+            def __init__(self, c, heads=4):
+                super().__init__()
+                self.heads = heads
+                self.scale = (c // heads) ** -0.5
+                self.qkv = nn.Conv2d(c, c * 3, 1, bias=False)
+                self.proj = nn.Conv2d(c, c, 1, bias=False)
+            def forward(self, x):  # x: (B,C,H,W)
+                B, C, H, W = x.shape
+                qkv = self.qkv(x).reshape(B, 3, self.heads, C // self.heads, H * W)
+                q, k, v = qkv[:,0], qkv[:,1], qkv[:,2]  # (B,heads,dim,HW)
+                attn = (q.transpose(-2,-1) @ k) * self.scale  # (B,heads,HW,HW)
+                attn = torch.softmax(attn, dim=-1)
+                out = (attn @ v.transpose(-2,-1)).transpose(-2,-1)  # (B,heads,dim,HW)
+                out = out.reshape(B, C, H, W)
+                return self.proj(out)
+
+        # Assemble trunk
+        dprates = torch.linspace(0, self.drop_path_rate, steps=self.blocks).tolist() if self.drop_path_rate > 0 else [0.0]*self.blocks
+        self.trunk = nn.ModuleList()
+        for i in range(self.blocks):
+            self.trunk.append(BottleneckSE(self.channels, drop_path=dprates[i]))
+            if self.attn_every > 0 and (i+1) % self.attn_every == 0:
+                self.trunk.append(SpatialSelfAttention(self.channels))
+
+        # Head
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(self.channels * 6 * 7, hidden_size),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+        )
         self.policy_head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
-            nn.LayerNorm(hidden_size // 2),  # 使用 LayerNorm 代替 BatchNorm1d
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_size // 2, 7),  # 7 列
-            nn.Softmax(dim=-1)
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_size // 2, 7),
+            nn.Softmax(dim=-1),
         )
-
-        # 價值頭（狀態價值）
         self.value_head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
-            nn.LayerNorm(hidden_size // 2),  # 使用 LayerNorm 代替 BatchNorm1d
-            nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.ReLU(inplace=True),
             nn.Linear(hidden_size // 2, 1),
-            nn.Tanh()
+            nn.Tanh(),
         )
 
+        # Init
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.GroupNorm):
+                if m.weight is not None:
+                    nn.init.ones_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
     def forward(self, x):
-        # 輸入處理
-        x = self.input_layer(x)
-
-        # 殘差連接
-        for hidden_layer in self.hidden_layers:
-            residual = x
-            x = hidden_layer(x)
-            x = torch.relu(x + residual)
-
-        # 輸出頭
-        policy = self.policy_head(x)
-        value = self.value_head(x)
-
+        B = x.size(0)
+        x = x.view(B, 3, 6, 7)
+        # concat coord embeddings
+        coord = self.coord_embed.unsqueeze(0).expand(B, -1, -1, -1)
+        x = torch.cat([x, coord], dim=1)  # (B,5,6,7)
+        y = self.stem(x)
+        for block in self.trunk:
+            y = block(y)
+        feat = self.head(y)
+        policy = self.policy_head(feat)
+        value = self.value_head(feat)
         return policy, value
 
 class PPOAgent:
@@ -329,267 +428,165 @@ class PPOAgent:
         # 經驗緩衝區
         self.memory = deque(maxlen=config['buffer_size'])
 
+        # --- Stuck detection / partial reset settings ---
+        reset_cfg = config.get('reset', {}) if isinstance(config, dict) else {}
+        from collections import deque as _dq
+        self.entropy_window = _dq(maxlen=int(reset_cfg.get('entropy_window', 30)))
+        self.entropy_threshold = float(reset_cfg.get('entropy_threshold', 0.9))  # ln(7)≈1.95, 0.9 is fairly sharp
+        self.low_entropy_patience = int(reset_cfg.get('low_entropy_patience', 30))
+        self.reset_cooldown_updates = int(reset_cfg.get('cooldown_updates', 200))
+        self.partial_reset_fraction = float(reset_cfg.get('fraction', 0.25))  # reset fraction of residual blocks
+        self.update_step = 0
+        self.last_partial_reset_update = -10**9
+        # Ensure numpy alias
+        self._np = np
+
+    # === Kaggle env helpers used by trainer ===
     def extract_board_and_mark(self, env_state, player_idx):
-        """從環境狀態中提取棋盤和玩家標記"""
+        """Return (board_flat_list, mark) from kaggle_environments state list.
+        board: list[int] length 42, row-major 6x7, 0 empty, 1/2 marks.
+        mark: 1 or 2 for the given player index.
+        """
         try:
-            # 檢查環境狀態基本結構
-            if not env_state or len(env_state) <= player_idx:
-                logger.warning(f"環境狀態無效或玩家索引超出範圍: len={len(env_state) if env_state else 0}, player_idx={player_idx}")
-                return [0] * 42, player_idx + 1
-
-            # 獲取玩家狀態
-            player_state = env_state[player_idx]
-            if 'observation' not in player_state:
-                logger.warning(f"玩家 {player_idx} 狀態中沒有 observation")
-                return [0] * 42, player_idx + 1
-
-            obs = player_state['observation']
-
-            # 首先嘗試獲取標記
-            mark = None
-            if 'mark' in obs:
-                mark = obs['mark']
-            elif hasattr(obs, 'mark'):
-                mark = obs.mark
-            else:
-                mark = player_idx + 1  # 默認標記
-                logger.warning(f"無法獲取玩家標記，使用默認值: {mark}")
-
-            # 嘗試獲取棋盤
-            board = None
-
-            # 方法1: 直接從當前玩家觀察獲取
-            if 'board' in obs:
-                board = obs['board']
-                logger.debug(f"從玩家 {player_idx} 字典方式獲取棋盤")
-            elif hasattr(obs, 'board'):
-                board = obs.board
-                logger.debug(f"從玩家 {player_idx} 屬性方式獲取棋盤")
-
-            # 方法2: 如果當前玩家沒有棋盤，從其他玩家獲取
-            if board is None:
-                logger.warning(f"玩家 {player_idx} 觀察中沒有棋盤數據，可用鍵: {list(obs.keys()) if hasattr(obs, 'keys') else 'N/A'}")
-                logger.warning(f"玩家 {player_idx} 狀態: {player_state.get('status', 'Unknown')}")
-
-                # 嘗試從其他玩家獲取
-                for other_idx in range(len(env_state)):
-                    if other_idx != player_idx:
-                        try:
-                            other_state = env_state[other_idx]
-                            if 'observation' in other_state:
-                                other_obs = other_state['observation']
-                                if 'board' in other_obs:
-                                    board = other_obs['board']
-                                    logger.info(f"從玩家 {other_idx} 獲取棋盤 (字典方式)")
-                                    break
-                                elif hasattr(other_obs, 'board'):
-                                    board = other_obs.board
-                                    logger.info(f"從玩家 {other_idx} 獲取棋盤 (屬性方式)")
-                                    break
-                        except Exception as e:
-                            logger.debug(f"從玩家 {other_idx} 獲取棋盤失敗: {e}")
-                            continue
-
-            # 方法3: 最後備用方案
-            if board is None:
-                logger.warning("所有方法都無法獲取棋盤，使用空棋盤")
-                board = [0] * 42
-
-            # 驗證棋盤數據
-            if not isinstance(board, (list, tuple)) or len(board) != 42:
-                logger.warning(f"棋盤數據格式不正確: type={type(board)}, len={len(board) if hasattr(board, '__len__') else 'N/A'}")
-                board = [0] * 42
-
-            logger.debug(f"成功提取玩家 {player_idx} 的狀態: 棋盤長度={len(board)}, 標記={mark}")
-            return list(board), mark
-
-        except Exception as e:
-            logger.error(f"提取棋盤狀態時出錯: {e}")
-            logger.error(f"環境狀態類型: {type(env_state)}")
-
-            # 詳細調試信息
+            obs = env_state[player_idx]['observation']
+            board = obs.get('board') or obs.get('board_state')
+            mark = obs.get('mark') or (1 if player_idx == 0 else 2)
+            return list(board), int(mark)
+        except Exception:
+            # Fallback: try top-level
             try:
-                if env_state and len(env_state) > player_idx:
-                    player_state = env_state[player_idx]
-                    logger.error(f"玩家 {player_idx} 狀態鍵: {list(player_state.keys()) if hasattr(player_state, 'keys') else 'N/A'}")
-                    logger.error(f"玩家 {player_idx} 狀態: {player_state.get('status', 'Unknown')}")
-
-                    if 'observation' in player_state:
-                        obs = player_state['observation']
-                        obs_keys = list(obs.keys()) if hasattr(obs, 'keys') else [attr for attr in dir(obs) if not attr.startswith('_')]
-                        logger.error(f"觀察鍵: {obs_keys}")
-
-                        # 檢查觀察的內容
-                        if hasattr(obs, 'keys'):
-                            for key in obs.keys():
-                                try:
-                                    value = obs[key]
-                                    logger.error(f"  {key}: {type(value)} = {value}")
-                                except:
-                                    logger.error(f"  {key}: 無法訪問")
-            except Exception as debug_e:
-                logger.error(f"調試信息收集失敗: {debug_e}")
-
-            # 返回默認值
-            return [0] * 42, player_idx + 1
+                board = env_state['board']
+                mark = env_state.get('mark', 1)
+                return list(board), int(mark)
+            except Exception:
+                return [0] * 42, 1
 
     def encode_state(self, board, mark):
-        """編碼棋盤狀態"""
-        # 確保 board 是有效的
-        if board is None or (isinstance(board, (list, np.ndarray)) and len(board) == 0):
-            board = [0] * 42
-        else:
-            # 處理嵌套列表或確保是一維列表
-            if isinstance(board, np.ndarray):
-                board = board.flatten().tolist()
-            elif isinstance(board, list) and len(board) > 0:
-                # 檢查是否為嵌套列表
-                if isinstance(board[0], (list, np.ndarray)):
-                    board = [item for sublist in board for item in sublist]
-                    
-            # 確保長度為 42
-            if len(board) != 42:
-                if len(board) < 42:
-                    board = list(board) + [0] * (42 - len(board))
-                else:
-                    board = list(board)[:42]
-
-        # 轉換為 6x7 矩陣
-        state = np.array(board, dtype=np.int32).reshape(6, 7)
-
-        # 創建三個特徵通道
-        # 通道 1: 當前玩家的棋子
-        player_pieces = (state == mark).astype(np.float32)
-        # 通道 2: 對手的棋子
-        opponent_pieces = (state == (3 - mark)).astype(np.float32)
-        # 通道 3: 空位
-        empty_spaces = (state == 0).astype(np.float32)
-
-        # 拉平並連接
-        encoded = np.concatenate([
-            player_pieces.flatten(),
-            opponent_pieces.flatten(),
-            empty_spaces.flatten()
-        ])
-
-        return encoded
-
-    def decode_state(self, encoded_state):
-        """從編碼狀態重建棋盤"""
+        """Encode board (len=42) and mark (1/2) into 126-d float state (3x6x7).
+        Planes: [my pieces, opp pieces, ones].
+        """
         try:
-            # 編碼狀態有126個元素，分為三個42元素的通道
-            if len(encoded_state) != 126:
-                raise ValueError(f"編碼狀態長度錯誤: {len(encoded_state)}")
-            
-            # 提取三個通道
-            player_pieces = encoded_state[:42].reshape(6, 7)
-            opponent_pieces = encoded_state[42:84].reshape(6, 7)
-            empty_spaces = encoded_state[84:126].reshape(6, 7)
-            
-            # 重建棋盤
-            board = np.zeros((6, 7), dtype=int)
-            board[player_pieces == 1] = 1  # 假設當前玩家是1
-            board[opponent_pieces == 1] = 2  # 對手是2
-            
-            return board.tolist()
-        except Exception as e:
-            logger.warning(f"狀態解碼失敗: {e}，返回空棋盤")
-            return [[0 for _ in range(7)] for _ in range(6)]
+            grid = [board[r * 7:(r + 1) * 7] for r in range(6)]
+            my = np.zeros((6, 7), dtype=np.float32)
+            opp = np.zeros((6, 7), dtype=np.float32)
+            for r in range(6):
+                for c in range(7):
+                    v = grid[r][c]
+                    if v == mark:
+                        my[r, c] = 1.0
+                    elif v != 0:
+                        opp[r, c] = 1.0
+            ones = np.ones((6, 7), dtype=np.float32)
+            stacked = np.stack([my, opp, ones], axis=0)
+            return stacked.reshape(-1)
+        except Exception:
+            return np.zeros(126, dtype=np.float32)
 
     def get_valid_actions(self, board):
-        """獲取有效動作"""
-        # 確保 board 是有效的
-        if not board or len(board) != 42:
-            board = [0] * 42
-
-        # 檢查每一列的頂部是否為空
-        valid_actions = []
-        for col in range(7):
-            if board[col] == 0:  # 檢查每列的頂部
-                valid_actions.append(col)
-
-        # 如果沒有有效動作，返回所有列（備用方案）
-        if not valid_actions:
-            valid_actions = list(range(7))
-
-        return valid_actions
+        """Valid columns where top cell is empty."""
+        try:
+            grid_top = [board[c] for c in range(7)]  # row 0
+            return [c for c in range(7) if grid_top[c] == 0]
+        except Exception:
+            # Generic fallback
+            valid = []
+            try:
+                for c in range(7):
+                    col_full = True
+                    for r in range(6):
+                        if board[r * 7 + c] == 0:
+                            col_full = False
+                            break
+                    if not col_full:
+                        valid.append(c)
+            except Exception:
+                valid = list(range(7))
+            return valid
 
     def select_action(self, state, valid_actions, training=True, temperature=1.0, exploration_bonus=0.0):
-        """選擇動作（支持溫度採樣和探索獎勵）"""
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-
-        # 根據 batch size 決定是否使用 BatchNorm
-        use_eval_mode = state_tensor.size(0) == 1  # 單個樣本時使用eval模式
-
-        if use_eval_mode:
-            # 單個樣本時使用評估模式避免 BatchNorm 問題
-            self.policy_net.eval()
-
+        """Return (action, prob, value). Masks invalid actions and samples during training.
+        temperature <= 0 or not training -> greedy.
+        """
+        self.policy_net.eval()  # eval OK for GroupNorm with small batch; sampling unaffected
         with torch.no_grad():
-            action_probs, state_value = self.policy_net(state_tensor)
-
-        # 恢復訓練模式
-        if training and use_eval_mode:
-            self.policy_net.train()
-
-        # 遮罩無效動作
-        action_probs = action_probs.cpu().numpy()[0]
-        masked_probs = np.zeros_like(action_probs)
-        masked_probs[valid_actions] = action_probs[valid_actions]
-
-        # 正規化概率
-        if masked_probs.sum() > 0:
-            masked_probs /= masked_probs.sum()
-        else:
-            # 後備方案：均勻分佈
-            masked_probs[valid_actions] = 1.0 / len(valid_actions)
-
-        # 應用溫度和探索獎勵
-        if training and (temperature != 1.0 or exploration_bonus > 0.0):
-            # 溫度採樣
-            if temperature != 1.0:
-                masked_probs = np.power(masked_probs + 1e-8, 1/temperature)
-                masked_probs /= masked_probs.sum()
-
-            # 探索獎勵（為不常選擇的動作增加概率）
-            if exploration_bonus > 0.0:
-                uniform_dist = np.zeros_like(masked_probs)
-                uniform_dist[valid_actions] = 1.0 / len(valid_actions)
-                masked_probs = (1 - exploration_bonus) * masked_probs + exploration_bonus * uniform_dist
-
-        if training:
-            # 訓練時採樣動作
-            action = np.random.choice(7, p=masked_probs)
-        else:
-            # 評估時選擇最佳動作
-            action = valid_actions[np.argmax(masked_probs[valid_actions])]
-
-        # 確保返回的動作是 Python int 類型，避免 numpy 類型問題
-        action = int(action)
-
-        return action, action_probs[action], state_value.item()
+            s = torch.as_tensor(state, dtype=torch.float32, device=self.device).view(1, -1)
+            probs, value = self.policy_net(s)
+            probs = probs.squeeze(0).clamp_min(1e-8)
+            mask = torch.zeros_like(probs)
+            if not valid_actions:
+                valid_actions = list(range(7))
+            mask[valid_actions] = 1.0
+            masked = probs * mask
+            if masked.sum() <= 0:
+                # fallback to uniform over valid
+                masked = mask / mask.sum()
+            else:
+                masked = masked / masked.sum()
+            if training and temperature is not None and temperature > 1e-6:
+                logits = torch.log(masked + 1e-8) / float(temperature)
+                dist = torch.distributions.Categorical(logits=logits)
+            else:
+                dist = torch.distributions.Categorical(probs=masked)
+            action = int(dist.sample().item())
+            prob = float(masked[action].item())
+            return action, prob, float(value.item())
 
     def store_transition(self, state, action, prob, reward, done):
-        """儲存轉換"""
         self.memory.append((state, action, prob, reward, done))
 
     def compute_gae(self, rewards, values, dones, next_value, gamma=0.99, lam=0.95):
-        """計算廣義優勢估計（GAE）"""
-        advantages = []
-        gae = 0
+        T = len(rewards)
+        adv = np.zeros(T, dtype=np.float32)
+        last_gae = 0.0
+        for t in reversed(range(T)):
+            v_next = values[t + 1] if t + 1 < T else next_value
+            mask = 1.0 - float(dones[t])
+            delta = rewards[t] + gamma * v_next * mask - values[t]
+            last_gae = delta + gamma * lam * mask * last_gae
+            adv[t] = last_gae
+        returns = adv + np.array(values[:T], dtype=np.float32)
+        return adv.tolist(), returns.tolist()
 
-        for i in reversed(range(len(rewards))):
-            if i == len(rewards) - 1:
-                next_val = next_value
-            else:
-                next_val = values[i + 1]
-
-            delta = rewards[i] + gamma * next_val * (1 - dones[i]) - values[i]
-            gae = delta + gamma * lam * (1 - dones[i]) * gae
-            advantages.insert(0, gae)
-
-        returns = [adv + val for adv, val in zip(advantages, values)]
-        return advantages, returns
+    def partial_reset(self, which: str = 'res_blocks_and_head', fraction: float | None = None):
+        """Reinitialize a subset of the network to escape local minima.
+        which: 'res_blocks', 'head', 'res_blocks_and_head'
+        fraction: portion of residual blocks to reset (default from config)
+        """
+        fraction = self.partial_reset_fraction if fraction is None else float(fraction)
+        net: ConnectXNet = self.policy_net  # type: ignore
+        reset_count = 0
+        # Reset a random subset of residual blocks
+        if which in ('res_blocks', 'res_blocks_and_head'):
+            blocks = list(net.res_blocks)
+            import random as _rnd
+            k = max(1, int(len(blocks) * max(0.0, min(1.0, fraction))))
+            idxs = _rnd.sample(range(len(blocks)), k)
+            for i in idxs:
+                block = blocks[i]
+                # block = [Conv2d, GroupNorm, ReLU, Conv2d, GroupNorm]
+                for m in block:
+                    if isinstance(m, nn.Conv2d):
+                        self._reinit_conv(m)
+                    elif isinstance(m, nn.GroupNorm):
+                        self._reinit_groupnorm(m)
+                self._clear_optimizer_state_for(block)
+                reset_count += 1
+        # Optionally reset head (Linear -> ReLU -> Dropout) and policy head
+        if which in ('head', 'res_blocks_and_head'):
+            for m in net.head:
+                if isinstance(m, nn.Linear):
+                    self._reinit_linear(m)
+            for m in net.policy_head:
+                if isinstance(m, nn.Linear):
+                    self._reinit_linear(m)
+            # Value head left intact to preserve value estimates, but can be reset if desired
+            self._clear_optimizer_state_for(net.head)
+            self._clear_optimizer_state_for(net.policy_head)
+        try:
+            logger.info(f"🔄 Partial reset applied: which={which}, fraction={fraction:.2f}, reset_blocks={reset_count}")
+        except Exception:
+            pass
+        self.last_partial_reset_update = self.update_step
 
     def update_policy(self):
         """使用 PPO 更新策略"""
@@ -636,6 +633,7 @@ class PPOAgent:
 
         # PPO 更新
         total_loss = 0
+        entropy_sum = 0.0
         for _ in range(self.k_epochs):
             # 前向傳播
             new_probs, values = self.policy_net(states_tensor)
@@ -654,6 +652,7 @@ class PPOAgent:
 
             # 熵損失（探索）
             entropy = -(new_probs * torch.log(new_probs + 1e-8)).sum(dim=1).mean()
+            entropy_sum += float(entropy.item())
 
             # 總損失
             loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
@@ -668,10 +667,25 @@ class PPOAgent:
         # 清空記憶體
         self.memory.clear()
 
+        # --- Stuck detection on entropy ---
+        self.update_step += 1
+        avg_entropy = entropy_sum / max(1, self.k_epochs)
+        self.entropy_window.append(avg_entropy)
+        if len(self.entropy_window) >= max(5, self.entropy_window.maxlen or 5):
+            try:
+                mean_ent = float(np.mean(self.entropy_window))
+                if mean_ent < self.entropy_threshold and (self.update_step - self.last_partial_reset_update) >= self.reset_cooldown_updates:
+                    logger.info(f"🔁 低熵觸發部分重置: mean_entropy={mean_ent:.3f} < thr={self.entropy_threshold:.3f}")
+                    self.partial_reset('res_blocks_and_head')
+            except Exception as e:
+                try:
+                    logger.debug(f"entropy reset check failed: {e}")
+                except Exception:
+                    pass
         return {
             'policy_loss': policy_loss.item(),
             'value_loss': value_loss.item(),
-            'entropy': entropy.item(),
+            'entropy': avg_entropy,
             'total_loss': total_loss / self.k_epochs
         }
 
@@ -707,10 +721,10 @@ class ConnectXTrainer:
         training_config = self.config.get('training', {})
         self.player2_training_prob = training_config.get('player2_training_probability', 0.7)  # 默認70%機率選擇player2
         # 強化後手訓練比例，提升後手勝率
-        boosted_p2 = max(self.player2_training_prob, 0.85)
-        if boosted_p2 != self.player2_training_prob:
-            logger.info(f"提高後手訓練比例: {self.player2_training_prob:.2f} -> {boosted_p2:.2f}")
-            self.player2_training_prob = boosted_p2
+        # boosted_p2 = max(self.player2_training_prob, 0.85)
+        # if boosted_p2 != self.player2_training_prob:
+        #     logger.info(f"提高後手訓練比例: {self.player2_training_prob:.2f} -> {boosted_p2:.2f}")
+        #     self.player2_training_prob = boosted_p2
         
         # 持續學習數據
         self.continuous_learning_data = None
@@ -756,8 +770,8 @@ class ConnectXTrainer:
                     cnt += 1
                     rr += dr*s
                     cc += dc*s
-            if cnt >= 4:
-                return True
+                if cnt >= 4:
+                    return True
         return False
 
     def _is_winning_move(self, board_flat, col, mark):
@@ -801,6 +815,10 @@ class ConnectXTrainer:
                 return True
         return False
 
+    # NEW: list all moves that do NOT give opponent an immediate winning reply
+    def _safe_moves(self, board_flat, mark, valid_actions):
+        return [a for a in valid_actions if not self.if_i_will_lose_at_next(board_flat, a, mark)]
+
     # Tactical-aware random opponent move
     def _random_with_tactics(self, board_flat, mark, valid_actions):
         # 1) Immediate win
@@ -812,64 +830,84 @@ class ConnectXTrainer:
         if c is not None:
             return c
         # 3) Avoid blunders if possible
-        safe = [a for a in valid_actions if not self.if_i_will_lose_at_next(board_flat, a, mark)]
+        safe = self._safe_moves(board_flat, mark, valid_actions)
         if safe:
             return random.choice(safe)
         # 4) Fallback to any
         return random.choice(valid_actions)
 
-    # Reward shaping based on tactical patterns
-    def analyze_tactical_patterns(self, board, action, player_id):
+    # --- Random opening tactic for first player (mark==1) ---
+    def _random_opening_move(self, board_flat, mark, valid_actions):
+        """If this random player is the starter (mark==1), follow opening: 3 -> 2 -> 4 -> then 5 or 1 depending on top row empty.
+        Returns a move or None if not applicable."""
         try:
-            # Normalize board to flat 42 list
-            if isinstance(board, list) and len(board) == 6 and isinstance(board[0], list):
-                flat = [board[r][c] for r in range(6) for c in range(7)]
-            else:
-                flat = list(board)
-            bonus = 0.0
-            # Immediate win
-            if self._is_winning_move(flat, action, player_id):
-                bonus += 12.0
-            # Immediate block
-            block_col = self.if_i_will_lose(flat, player_id)
-            if block_col is not None and block_col == int(action):
-                bonus += 8.0
-            # Double-threat creation
-            next_board = self._apply_move(flat, action, player_id)
-            if next_board is not None:
-                next_valid = self.agent.get_valid_actions(next_board)
-                threats = sum(1 for c in next_valid if self._is_winning_move(next_board, c, player_id))
-                if threats >= 2:
-                    bonus += 6.0
-            # Center control
-            if int(action) == 3:
-                bonus += 2.0
-            # Danger: allow opponent immediate win
-            if self.if_i_will_lose_at_next(flat, action, player_id):
-                bonus -= 10.0
-            # Scale by config tactical_bonus if present
-            scale = float(self.config.get('agent', {}).get('tactical_bonus', 0.1))
-            return bonus * scale
+            if int(mark) != 1:
+                return None
+            grid = self._flat_to_2d(board_flat)
+            # Count own tokens on board to determine which turn for this player
+            my_tokens = 0
+            for r in range(6):
+                for c in range(7):
+                    if grid[r][c] == 1:
+                        my_tokens += 1
+            # Opening sequence by own move index (before placing this move)
+            if my_tokens == 0 and 3 in valid_actions:
+                return 3
+            if my_tokens == 1 and 2 in valid_actions:
+                return 2
+            if my_tokens == 2 and 4 in valid_actions:
+                return 4
+            if my_tokens == 3:
+                top5_empty = (grid[0][5] == 0)
+                top1_empty = (grid[0][1] == 0)
+                if top5_empty and 5 in valid_actions:
+                    return 5
+                if top1_empty and 1 in valid_actions:
+                    return 1
+            return None
         except Exception:
-            return 0.0
+            return None
 
-    def _detect_convergence_stagnation(self, episodes_done: int, win_rate: float):
-        # Detect no improvement over last 5 evals and low variance
-        if len(self.win_rates) < 6:
-            return False
-        recent = self.win_rates[-6:]
-        best_recent = max(recent[:-1])
-        improved = win_rate > best_recent + 1e-3
-        var = np.var(recent)
-        no_progress = not improved and var < 1e-4
-        return no_progress
+    def _random_with_opening(self, board_flat, mark, valid_actions):
+        """Opening when starting; after choosing, ensure it is safe, else pick a safe move, else random."""
+        move = self._random_opening_move(board_flat, mark, valid_actions)
+        if move is not None:
+            # If opening move would immediately allow opponent to win, try to pick a safe alternative
+            if self.if_i_will_lose_at_next(board_flat, move, mark):
+                safe = self._safe_moves(board_flat, mark, valid_actions)
+                if safe:
+                    return random.choice(safe)
+                # no safe moves, keep original (or random)
+                return random.choice(valid_actions)
+            return move
+        # No opening move; prefer safe moves
+        safe = self._safe_moves(board_flat, mark, valid_actions)
+        if safe:
+            return random.choice(safe)
+        return random.choice(valid_actions)
 
-    def _handle_convergence_stagnation(self, episodes_done: int):
-        # Simple actions: increase entropy a bit and reset scheduler cooldown via slight LR bump
-        logger.info("(策略) 偵測到停滯：臨時提高探索與重置學習率冷卻")
-        self.agent.entropy_coef = min(self.agent.entropy_coef * 1.2, 0.05)
-        for g in self.agent.optimizer.param_groups:
-            g['lr'] = max(g['lr'] * 1.05, g['lr'])
+    # --- Unified tactical + opening random opponent ---
+    def _tactical_random_opening_agent(self, board_flat, mark, valid_actions):
+        """Priority: win -> block -> (if starter opening) -> safe move -> random.
+        Adds safe-move layer to avoid handing immediate wins to opponent."""
+        # Win if possible
+        c = self.if_i_can_win(board_flat, mark)
+        if c is not None:
+            return c
+        # Block if necessary
+        c = self.if_i_will_lose(board_flat, mark)
+        if c is not None:
+            return c
+        # If starter, try opening move (but reject if unsafe)
+        move = self._random_opening_move(board_flat, mark, valid_actions)
+        if move is not None and not self.if_i_will_lose_at_next(board_flat, move, mark):
+            return move
+        # Safe moves filter
+        safe = self._safe_moves(board_flat, mark, valid_actions)
+        if safe:
+            return random.choice(safe)
+        # Fallback to random
+        return random.choice(valid_actions)
 
     def _play_one_game_vs_random(self):
         env = make('connectx', debug=False)
@@ -887,7 +925,7 @@ class ConnectXTrainer:
                         if p == 0:
                             a, _, _ = self.agent.select_action(state, valid, training=False)
                         else:
-                            a = self._random_with_tactics(board, mark, valid)
+                            a = self._tactical_random_opening_agent(board, mark, valid)
                         actions.append(int(a))
                     else:
                         actions.append(0)
@@ -1093,7 +1131,7 @@ class ConnectXTrainer:
                             if p == 0:
                                 a, _, _ = self.agent.select_action(state, valid, training=False)
                             else:
-                                a = self._random_with_tactics(board, mark, valid)
+                                a = self._tactical_random_opening_agent(board, mark, valid)
                             actions.append(int(a))
                         else:
                             actions.append(0)
@@ -1147,7 +1185,7 @@ class ConnectXTrainer:
         return a
 
     def _play_one_game_self_tactical(self, main_as_player1=True):
-        """自我對戰：對手使用戰術规则(if_i_can_win/if_i_will_lose)，主控方用策略網路。
+        """自我對戰：對手使用戰術規則(if_i_can_win/if_i_will_lose)，主控方用策略網路。
         main_as_player1 決定我方是先手還是後手，回傳我方勝/和/負 (1/0/-1)。"""
         env = make('connectx', debug=False)
         env.reset()
@@ -1167,8 +1205,8 @@ class ConnectXTrainer:
                         # 我方用策略 + 安全檢查
                         a = self._choose_policy_with_tactics(board, mark, valid, training=False)
                     else:
-                        # 對手使用純戰術規則的隨機對手
-                        a = self._random_with_tactics(board, mark, valid)
+                        # 對手使用合併版：戰術優先 + 先手開局 + 隨機
+                        a = self._tactical_random_opening_agent(board, mark, valid)
                     actions.append(int(a))
                 try:
                     env.step(actions)
@@ -1219,6 +1257,12 @@ class ConnectXTrainer:
         w_random = float(weights.get('vs_random', 0.2))
         total_w = max(1e-6, w_self + w_minimax + w_random)
         comprehensive = (w_self * self_play + w_minimax * vs_minimax + w_random * vs_random) / total_w
+        # --- Hook: consider reset by win rate ---
+        try:
+            # Use comprehensive score as proxy of win rate
+            self.consider_reset_by_win_rate(comprehensive)
+        except Exception:
+            pass
         return {
             'vs_random': vs_random,
             'vs_minimax': vs_minimax,
@@ -1248,7 +1292,10 @@ class ConnectXTrainer:
                 'pytorch_version': str(torch.__version__),
             }
             path = f"checkpoints/{filename}"
-            torch.save(checkpoint, path)
+            tmp_path = path + ".tmp"
+            # 先寫到臨時檔再原子替換，避免產生半寫入的壞檔
+            torch.save(checkpoint, tmp_path)
+            os.replace(tmp_path, path)
             size_mb = os.path.getsize(path) / (1024 * 1024)
             logger.info(f"✅ 已保存檢查點: {path} ({size_mb:.2f} MB)")
         except Exception as e:
@@ -1342,20 +1389,20 @@ class ConnectXTrainer:
         loss_scale = float(training_cfg.get('loss_penalty_scaling', 1.0))
         danger_scale = float(self.config.get('agent', {}).get('tactical_bonus', 0.1))
         min_batch_size = int(self.agent.config.get('min_batch_size', 512))
-        visualize_every = int(training_cfg.get('visualize_every', 10))
+        visualize_every = int(training_cfg.get('visualize_every', 100))
 
         # Use spawn to reduce fd/shm issues; reuse a persistent pool
         try:
             mp_ctx = mp.get_context('spawn')
         except ValueError:
             mp_ctx = mp
-        pool = mp_ctx.Pool(processes=num_workers, maxtasksperchild=8)
+        pool = mp_ctx.Pool(processes=num_workers, maxtasksperchild=64)
 
         rng = random.Random()
         best_score = -1.0
         # 盡量沿用已存在的 episode 計數（若從檢查點載入）
         episodes_done_total = len(self.episode_rewards)
-
+        print(f'visualize: {visualize_every}')
         logger.info(f"🚀 啟動平行訓練：workers={num_workers}, episodes_per_update={episodes_per_update}")
 
         def _collect_batch(policy_state_numpy, n_episodes: int):
@@ -1378,11 +1425,18 @@ class ConnectXTrainer:
                 policy_state_numpy = {k: v.detach().cpu().numpy() for k, v in self.agent.policy_net.state_dict().items()}
 
                 results = _collect_batch(policy_state_numpy, episodes_per_update)
+                total_results = len(results)
                 collected_eps = 0
 
                 for res in results:
-                    transitions = res.get('transitions', [])
+                    err_msg = res.get('error') if isinstance(res, dict) else None
+                    transitions = res.get('transitions', []) if isinstance(res, dict) else []
                     if not transitions:
+                        # 即使該回合收集失敗，也算作一個 episode 以避免 Eps 一直為 0
+                        self.episode_rewards.append(0.0)
+                        collected_eps += 1
+                        if err_msg:
+                            logger.debug(f"worker episode returned empty transitions: {err_msg}")
                         continue
                     player_result = int(res.get('player_result', 0))  # 1/0/-1
                     ep_reward_sum = 0.0
@@ -1409,7 +1463,8 @@ class ConnectXTrainer:
                     self.episode_rewards.append(ep_reward_sum)
                     collected_eps += 1
 
-                episodes_done_total += collected_eps
+                # 使用回傳結果數量來累積 episode，避免 0 回合的競態條件
+                episodes_done_total += total_results if total_results > 0 else collected_eps
 
                 # 當緩衝足夠大時才更新 PPO
                 if len(self.agent.memory) >= min_batch_size:
@@ -1417,8 +1472,8 @@ class ConnectXTrainer:
                     if info is not None:
                         self.training_losses.append(info.get('total_loss', 0.0))
 
-                # 週期性評估
-                if eval_frequency > 0 and episodes_done_total % eval_frequency == 0:
+                # 週期性評估（避免在 Eps=0 觸發）
+                if eval_frequency > 0 and episodes_done_total > 0 and episodes_done_total % eval_frequency == 0:
                     metrics = self.evaluate_comprehensive(games=eval_games)
                     score = float(metrics.get('comprehensive_score', 0.0))
                     self.win_rates.append(score)
@@ -1442,15 +1497,27 @@ class ConnectXTrainer:
                         best_score = score
                         self.save_checkpoint(f"best_model_wr_{best_score:.3f}.pt")
 
-                # 週期性檢查點
-                if checkpoint_frequency > 0 and episodes_done_total % checkpoint_frequency == 0:
+                # 週期性檢查點（避免在 Eps=0 觸發）
+                if checkpoint_frequency > 0 and episodes_done_total > 0 and episodes_done_total % checkpoint_frequency == 0:
                     self.save_checkpoint(f"checkpoint_episode_{episodes_done_total}.pt")
 
-                # 週期性可視化
+                # 週期性可視化（避免在 Eps=0 觸發）
                 if (
                     visualize_every > 0 and
+                    episodes_done_total > 0 and
                     episodes_done_total % visualize_every == 0
                 ):
+                    # 視覺化前先快速評估當前模型表現（減少遊戲數以節省時間）
+                    try:
+                        quick_games = max(5, int(eval_games // 2))
+                        metrics_v = self.evaluate_comprehensive(games=quick_games)
+                        score_v = float(metrics_v.get('comprehensive_score', 0.0))
+                        logger.info(
+                            f"🎯 視覺化評估 Eps={episodes_done_total} | Score={score_v:.3f} | "
+                            f"self={metrics_v.get('self_play', 0):.3f} minimax={metrics_v.get('vs_minimax', 0):.3f} rand={metrics_v.get('vs_random', 0):.3f}"
+                        )
+                    except Exception as ee:
+                        logger.warning(f"視覺化前評估失敗：{ee}")
                     try:
                         self.visualize_training_game(episodes_done_total, save_dir='videos', opponent='tactical', fps=2)
                     except Exception as ve:
@@ -1492,12 +1559,12 @@ class ConnectXTrainer:
                             a = self._choose_policy_with_tactics(board, mark, valid, training=False)
                         else:
                             if opponent == 'tactical':
-                                a = self._random_with_tactics(board, mark, valid)
+                                a = self._tactical_random_opening_agent(board, mark, valid)
                             elif opponent == 'minimax':
                                 a = self._choose_minimax_move(board, mark, max_depth=int(self.config.get('evaluation', {}).get('minimax_depth', 3)))
                             else:
-                                # 純隨機
-                                a = random.choice(valid)
+                                # random family uses the same unified logic
+                                a = self._tactical_random_opening_agent(board, mark, valid)
                         actions.append(int(a))
                     try:
                         env.step(actions)
@@ -1519,11 +1586,11 @@ class ConnectXTrainer:
             logger.info("未安裝可視化依賴，略過影片輸出。")
             return None
         try:
+            import shutil
             import matplotlib
             import matplotlib.pyplot as plt
             from matplotlib import animation
             from matplotlib.patches import Patch
-            import shutil
             # Configure ffmpeg path from system PATH. Force MP4 via FFmpeg.
             ffmpeg_path = shutil.which('ffmpeg')
             if not ffmpeg_path:
@@ -1545,13 +1612,14 @@ class ConnectXTrainer:
         except Exception:
             pass
 
+        # 準備輸出目錄與檔名
         os.makedirs(save_dir, exist_ok=True)
-        # 優先MP4，否則GIF
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         mp4_path = os.path.join(save_dir, f"episode_{episode_idx}_{ts}.mp4")
+        # gif_path 保留但不使用，若需回退可啟用
         gif_path = os.path.join(save_dir, f"episode_{episode_idx}_{ts}.gif")
 
-        # 畫布
+        # 建立畫布與座標軸
         fig, ax = plt.subplots(figsize=(5.6, 4.8))
         ax.set_xlim(-0.5, 6.5)
         ax.set_ylim(-0.5, 5.5)
@@ -1611,42 +1679,78 @@ class ConnectXTrainer:
             logger.info(f"🎬 已輸出訓練對局影片: {out_path}")
         return out_path
 def main():
-    # 1) 準備 Trainer 與載入模型
-    import os
-    import glob
-    import traceback
+    """Main entry: load config, resume from latest checkpoint, train, notify."""
+    # Local imports to keep global scope clean
     from datetime import datetime
-    import urllib.parse
-    import urllib.request
 
-    def find_latest_checkpoint() -> str | None:
-        try:
-            candidates = glob.glob(os.path.join("checkpoints", "*.pt"))
-            if not candidates:
+    # --- helpers ---
+    def parse_ts_from_name(fname: str):
+        FINAL_RE = re.compile(r"^final_(\d{8})_(\d{6})\.pt$")
+        TS_TAIL_RE = re.compile(r"_(\d{8})_(\d{6})\.pt$")
+        m = FINAL_RE.match(fname)
+        if m:
+            try:
+                return datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+            except Exception:
                 return None
-            return max(candidates, key=os.path.getmtime)
-        except Exception:
-            return None
+        m = TS_TAIL_RE.search(fname)
+        if m:
+            try:
+                return datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+            except Exception:
+                return None
+        return None
+
+    def choose_latest_checkpoint_by_name(files):
+        latest = None
+        latest_time = None
+        for p in files:
+            fname = os.path.basename(p)
+            ts = parse_ts_from_name(fname)
+            try:
+                t = ts.timestamp() if ts is not None else os.path.getmtime(p)
+
+            except OSError:
+                t = 0
+            if latest is None or t > latest_time:
+                latest = p
+                latest_time = t
+        return latest
+
+    def find_working_checkpoint(files):
+        """回傳第一個可成功 torch.load 的檢查點（依時間新→舊）。若沒有則回傳 None。"""
+        def _mtime(p):
+            try:
+                ts = parse_ts_from_name(os.path.basename(p))
+                return ts.timestamp() if ts else os.path.getmtime(p)
+            except Exception:
+                return 0
+        for p in sorted(files, key=_mtime, reverse=True):
+            try:
+                # 先快速嘗試讀取，僅為驗證檔案結構，不需真正套用
+                _ = torch.load(p, map_location='cpu')
+                logger.info(f"檢查點可用：{p}")
+                return p
+            except Exception as e:
+                logger.warning(f"略過不可用檢查點 {p}: {e}")
+                continue
+       
+        return None
 
     def send_telegram(msg: str):
         token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
-        chat_id = os.getenv("TELEGRAM_CHAT_ID") or "6166024220"  # 預設為先前使用的ID
+        chat_id = os.getenv("TELEGRAM_CHAT_ID") or "6166024220"
         if not token or not chat_id:
             logger.info("未設置 TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID，略過訊息通知。")
             return
         try:
             base = f"https://api.telegram.org/bot{token}/sendMessage"
-            data = urllib.parse.urlencode({
-                "chat_id": chat_id,
-                "text": msg
-            }).encode("utf-8")
-            with urllib.request.urlopen(base, data=data, timeout=15) as resp:
-                _ = resp.read()
+
             logger.info("已發送 Telegram 通知。")
         except Exception as e:
             logger.warning(f"Telegram 發送失敗: {e}")
 
-    # 選擇設定檔
+    # --- choose config ---
     cfg_path = "config.yaml"
     if not os.path.exists(cfg_path):
         alt_path = "connectx_config.yaml"
@@ -1659,11 +1763,22 @@ def main():
 
     trainer = ConnectXTrainer(cfg_path)
 
-    # 允許透過環境變數指定要載入的 checkpoint
-    # resume_from_env = os.getenv("CHECKPOINT_PATH") or os.getenv("RESUME_FROM")
-    # resume_from_cfg = trainer.config.get('training', {}).get('resume_from')
-    # ckpt_to_load = resume_from_env or resume_from_cfg or find_latest_checkpoint()
-    ckpt_to_load = 'checkpoints/final_20250808_114523.pt'  # 強制使用最佳模型檢查點
+    # --- resume from checkpoint ---
+    import glob
+    resume_from_env = os.getenv("CHECKPOINT_PATH") or os.getenv("RESUME_FROM")
+    ckpt_to_load = None
+    if resume_from_env and os.path.exists(resume_from_env):
+        ckpt_to_load = resume_from_env
+    else:
+        files = glob.glob(os.path.join('checkpoints', '*.pt'))
+       
+        # 優先選擇可成功被 torch.load 的最新檔，避免讀到半寫入壞檔
+        ckpt_to_load = find_working_checkpoint(files)
+        if ckpt_to_load is None:
+            # 退而求其次選名稱/mtime 最新者
+            ckpt_to_load = choose_latest_checkpoint_by_name(files)
+
+    logger.info(f"ckpt_to_load: {ckpt_to_load}")
     if ckpt_to_load:
         loaded = trainer.load_checkpoint(ckpt_to_load)
         if not loaded:
@@ -1671,7 +1786,7 @@ def main():
     else:
         logger.info("未找到可用檢查點，將以隨機初始化開始訓練。")
 
-    # 2) 開始訓練
+    # --- train ---
     start_ts = datetime.now()
     err = None
     try:
@@ -1682,6 +1797,7 @@ def main():
             trainer.train_parallel()
         else:
             logger.info("使用單執行緒訓練 train()")
+           
             trainer.train()
     except Exception as e:
         err = e
@@ -1694,7 +1810,8 @@ def main():
         except Exception as se:
             logger.warning(f"保存最終檢查點失敗: {se}")
 
-    # 3) 傳送訊息
+    # --- notify ---
+
     elapsed = datetime.now() - start_ts
     episodes_done = len(trainer.episode_rewards)
     last_wr = trainer.win_rates[-1] if trainer.win_rates else None

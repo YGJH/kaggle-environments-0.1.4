@@ -12,7 +12,7 @@ import sys
 import numpy as np
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QGridLayout, QPushButton, QLabel, 
-                            QMessageBox, QFrame)
+                            QMessageBox, QFrame, QRadioButton, QButtonGroup)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont, QPalette, QColor
 from kaggle_environments import make, utils
@@ -80,13 +80,15 @@ class ConnectXGUI(QMainWindow):
         self.game_over = False
         self.ai_thinking = False
         self.ai_thread = None
+        # 先手選擇：預設人類先手
+        self.ai_starts = False
         
         self.init_ui()
         
     def init_ui(self):
         """初始化用戶界面"""
         self.setWindowTitle("ConnectX - 人類 vs AI")
-        self.setFixedSize(800, 700)
+        self.setFixedSize(800, 740)
         self.setStyleSheet("""
             QMainWindow {
                 background-color: #2c3e50;
@@ -107,8 +109,8 @@ class ConnectXGUI(QMainWindow):
         
         # 主佈局
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setSpacing(20)
-        main_layout.setContentsMargins(30, 30, 30, 30)
+        main_layout.setSpacing(16)
+        main_layout.setContentsMargins(30, 20, 30, 20)
         
         # 標題
         title_label = QLabel("🎮 ConnectX - 人類 vs AI 對戰")
@@ -123,6 +125,26 @@ class ConnectXGUI(QMainWindow):
         self.status_label.setFont(QFont("Arial", 14, QFont.Bold))
         self.status_label.setStyleSheet("color: white; margin: 5px;")
         main_layout.addWidget(self.status_label)
+
+        # 先手選擇
+        starter_layout = QHBoxLayout()
+        starter_layout.setAlignment(Qt.AlignCenter)
+        starter_label = QLabel("先手：")
+        starter_label.setFont(QFont("Arial", 11))
+        self.rb_human_first = QRadioButton("我先手")
+        self.rb_ai_first = QRadioButton("AI先手")
+        self.rb_human_first.setChecked(True)
+        self.rb_human_first.setObjectName('human_first')
+        self.rb_ai_first.setObjectName('ai_first')
+        self.starter_group = QButtonGroup(self)
+        self.starter_group.addButton(self.rb_human_first)
+        self.starter_group.addButton(self.rb_ai_first)
+        self.rb_human_first.toggled.connect(self._on_starter_changed)
+        self.rb_ai_first.toggled.connect(self._on_starter_changed)
+        starter_layout.addWidget(starter_label)
+        starter_layout.addWidget(self.rb_human_first)
+        starter_layout.addWidget(self.rb_ai_first)
+        main_layout.addLayout(starter_layout)
         
         # 遊戲棋盤框架
         board_frame = QFrame()
@@ -255,7 +277,14 @@ class ConnectXGUI(QMainWindow):
         
         # 顯示歡迎消息
         QTimer.singleShot(100, self.show_welcome_message)
-        
+
+    def _on_starter_changed(self, checked: bool):
+        if not checked:
+            return
+        # 根據選項更新狀態，並重開局以套用
+        self.ai_starts = self.rb_ai_first.isChecked()
+        self.restart_game()
+
     def show_welcome_message(self):
         """顯示歡迎消息"""
         msg = QMessageBox()
@@ -482,14 +511,22 @@ class ConnectXGUI(QMainWindow):
             self.ai_thread.wait()
         
         self.board = np.zeros((self.rows, self.cols), dtype=int)
-        self.current_player = 1
         self.game_over = False
         self.ai_thinking = False
-        
         self.update_board_display()
-        self.status_label.setText("🔴 你的回合！")
-        self.status_label.setStyleSheet("color: white; font-weight: bold;")
-        self.enable_buttons()
+        
+        # 根據先手選擇設定當前玩家與狀態
+        if self.ai_starts:
+            self.current_player = 2  # AI 行動
+            self.status_label.setText("🟡 AI思考中...")
+            self.status_label.setStyleSheet("color: #f39c12; font-weight: bold;")
+            self.disable_buttons()
+            QTimer.singleShot(300, self.ai_turn)
+        else:
+            self.current_player = 1  # 人類行動
+            self.status_label.setText("🔴 你的回合！")
+            self.status_label.setStyleSheet("color: white; font-weight: bold;")
+            self.enable_buttons()
     
     def quit_game(self):
         """退出遊戲"""

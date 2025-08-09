@@ -13,7 +13,7 @@ import sys
 import numpy as np
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QGridLayout, QPushButton, QLabel, 
-                            QMessageBox, QFrame, QProgressBar)
+                            QMessageBox, QFrame, QProgressBar, QRadioButton, QButtonGroup)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont, QPalette, QColor
 import time
@@ -248,12 +248,14 @@ class ConnectXGUI(QMainWindow):
         self.rows = 6
         self.cols = 7
         self.board = np.zeros((self.rows, self.cols), dtype=int)
-        self.current_player = 1  # 1 = AI (先手), 2 = 人類 (後手)
+        self.current_player = 1  # 1 = AI (預設先手), 2 = 人類
         self.game_over = False
         self.ai_thinking = False
         self.ai_thread = None
         self.lookup_table = None  # 改為 DynamicLookupTable 實例
         self.table_ready = False
+        # 先手選擇，預設 AI 先手
+        self.ai_starts = True
         
         self.init_ui()
         self.check_lookup_table()
@@ -261,7 +263,7 @@ class ConnectXGUI(QMainWindow):
     def init_ui(self):
         """初始化用戶界面"""
         self.setWindowTitle("ConnectX - 人類 vs AI (查表版)")
-        self.setFixedSize(800, 750)
+        self.setFixedSize(800, 790)
         self.setStyleSheet("""
             QMainWindow {
                 background-color: #2c3e50;
@@ -283,7 +285,7 @@ class ConnectXGUI(QMainWindow):
         # 主佈局
         main_layout = QVBoxLayout(central_widget)
         main_layout.setSpacing(20)
-        main_layout.setContentsMargins(30, 30, 30, 30)
+        main_layout.setContentsMargins(30, 20, 30, 20)
         
         # 標題
         title_label = QLabel("🎮 ConnectX - 人類 vs AI 對戰 (動態查表版)")
@@ -305,6 +307,24 @@ class ConnectXGUI(QMainWindow):
         self.status_label.setFont(QFont("Arial", 14, QFont.Bold))
         self.status_label.setStyleSheet("color: white; margin: 5px;")
         main_layout.addWidget(self.status_label)
+
+        # 先手選擇
+        starter_layout = QHBoxLayout()
+        starter_layout.setAlignment(Qt.AlignCenter)
+        starter_label = QLabel("先手：")
+        starter_label.setFont(QFont("Arial", 11))
+        self.rb_human_first = QRadioButton("我先手")
+        self.rb_ai_first = QRadioButton("AI先手")
+        self.rb_ai_first.setChecked(True)
+        self.starter_group = QButtonGroup(self)
+        self.starter_group.addButton(self.rb_human_first)
+        self.starter_group.addButton(self.rb_ai_first)
+        self.rb_human_first.toggled.connect(self._on_starter_changed)
+        self.rb_ai_first.toggled.connect(self._on_starter_changed)
+        starter_layout.addWidget(starter_label)
+        starter_layout.addWidget(self.rb_human_first)
+        starter_layout.addWidget(self.rb_ai_first)
+        main_layout.addLayout(starter_layout)
         
         # AI 解釋標籤
         self.ai_explanation_label = QLabel("")
@@ -438,12 +458,20 @@ class ConnectXGUI(QMainWindow):
         main_layout.addLayout(control_layout)
         
         # 遊戲說明
-        info_label = QLabel("目標：連續四個棋子（水平、垂直或對角線）\n� AI是黃色（先手）  � 你是紅色（後手）（動態查表決策）")
+        info_label = QLabel("目標：連續四個棋子（水平、垂直或對角線）\n🟡 AI是黃色（先手可選）  🔴 你是紅色（後手或先手）")
         info_label.setAlignment(Qt.AlignCenter)
         info_label.setFont(QFont("Arial", 10))
         info_label.setStyleSheet("color: #bdc3c7; margin: 10px;")
         main_layout.addWidget(info_label)
-        
+
+    def _on_starter_changed(self, checked: bool):
+        if not checked:
+            return
+        # 更新先手選擇，若表已就緒則立即重開局
+        self.ai_starts = self.rb_ai_first.isChecked()
+        if self.table_ready:
+            self.restart_game()
+
     def check_lookup_table(self):
         """檢查查表文件"""
         self.checker_thread = LookupTableChecker("connectx-state-action-value.txt")
@@ -462,14 +490,19 @@ class ConnectXGUI(QMainWindow):
             # 隱藏檢查標籤
             self.check_label.hide()
             
-            self.status_label.setText("� AI的回合！")
-            print('\a')
-            self.status_label.setStyleSheet("color: white; font-weight: bold;")
-            self.enable_buttons()
             self.restart_button.setEnabled(True)
-            
-            # 顯示歡迎消息，然後AI先行
-            QTimer.singleShot(100, self.show_welcome_message)
+            self.enable_buttons()  # 可能會被下方關閉
+
+            # 根據先手選擇開始
+            if self.ai_starts:
+                self.status_label.setText("🟡 AI的回合！")
+                self.status_label.setStyleSheet("color: white; font-weight: bold;")
+                self.disable_buttons()
+                QTimer.singleShot(300, self.ai_turn)
+            else:
+                self.status_label.setText("🔴 你的回合！")
+                self.status_label.setStyleSheet("color: white; font-weight: bold;")
+                self.enable_buttons()
         else:
             self.status_label.setText("❌ 查表文件不可用")
             self.status_label.setStyleSheet("color: #e74c3c; font-weight: bold;")
@@ -721,19 +754,27 @@ class ConnectXGUI(QMainWindow):
             self.ai_thread.wait()
         
         self.board = np.zeros((self.rows, self.cols), dtype=int)
-        self.current_player = 1  # AI先手
         self.game_over = False
         self.ai_thinking = False
-        
         self.update_board_display()
-        self.status_label.setText("� AI的回合！")
-        self.status_label.setStyleSheet("color: white; font-weight: bold;")
         self.ai_explanation_label.setText("")
-        self.enable_buttons()
         
-        # 重新開始後，AI先行
-        QTimer.singleShot(500, self.ai_turn)
-    
+        if not self.table_ready:
+            return
+        
+        # 根據先手選擇設定當前玩家並啟動
+        if self.ai_starts:
+            self.current_player = 1  # AI 在此程式中使用棋子 1
+            self.status_label.setText("🟡 AI的回合！")
+            self.status_label.setStyleSheet("color: white; font-weight: bold;")
+            self.disable_buttons()
+            QTimer.singleShot(300, self.ai_turn)
+        else:
+            self.current_player = 2  # 人類先
+            self.status_label.setText("🔴 你的回合！")
+            self.status_label.setStyleSheet("color: white; font-weight: bold;")
+            self.enable_buttons()
+
     def quit_game(self):
         """退出遊戲"""
         reply = QMessageBox.question(
