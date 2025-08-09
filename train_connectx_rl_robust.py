@@ -7,6 +7,10 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import random
+import math
+import re
+import glob
+import shutil
 from collections import deque
 import logging
 from datetime import datetime
@@ -68,6 +72,236 @@ logger = logging.getLogger(__name__)
 # 確保logger訊息不被抑制
 logger.setLevel(logging.INFO)
 
+# ===== Shared Tactical Functions =====
+# These functions are used by both worker processes and the main trainer
+
+def flat_to_2d(board_flat):
+    """Convert flat board to 2D grid format."""
+    try:
+        if isinstance(board_flat[0], list):
+            return board_flat
+    except Exception:
+        pass
+    return [list(board_flat[r*7:(r+1)*7]) for r in range(6)]
+
+def find_drop_row(grid, col):
+    """Find the lowest empty row in a column."""
+    for r in range(5, -1, -1):
+        if grid[r][col] == 0:
+            return r
+    return None
+
+def is_win_from(grid, r, c, mark):
+    """Check if placing a mark at (r,c) creates a winning line."""
+    dirs = [(1,0), (0,1), (1,1), (-1,1)]
+    for dr, dc in dirs:
+        cnt = 1
+        for s in (1, -1):
+            rr, cc = r + dr*s, c + dc*s
+            while 0 <= rr < 6 and 0 <= cc < 7 and grid[rr][cc] == mark:
+                cnt += 1
+                rr += dr*s
+                cc += dc*s
+        if cnt >= 4:
+            return True
+    return False
+
+def is_winning_move(board_flat, col, mark):
+    """Check if a move in col is a winning move for mark."""
+    grid = flat_to_2d(board_flat)
+    if col < 0 or col > 6:
+        return False
+    r = find_drop_row(grid, col)
+    if r is None:
+        return False
+    grid[r][col] = mark
+    return is_win_from(grid, r, col, mark)
+
+def apply_move(board_flat, col, mark):
+    """Apply a move and return the new board state."""
+    grid = flat_to_2d(board_flat)
+    if col < 0 or col > 6:
+        return None
+    r = find_drop_row(grid, col)
+    if r is None:
+        return None
+    grid[r][col] = mark
+    return [grid[i][j] for i in range(6) for j in range(7)]
+
+def if_i_can_win(board_flat, mark, agent):
+    """Find a winning move for mark, if any."""
+    for c in agent.get_valid_actions(board_flat):
+        if is_winning_move(board_flat, c, mark):
+            return c
+    return None
+
+def if_i_will_lose(board_flat, mark, agent):
+    """Find a move to block opponent's immediate win."""
+    opp = 3 - mark
+    for c in agent.get_valid_actions(board_flat):
+        if is_winning_move(board_flat, c, opp):
+            return c
+    return None
+
+def if_i_will_lose_at_next(board_flat, move_col, mark, agent):
+    """Check if making move_col gives opponent an immediate winning reply."""
+    grid = flat_to_2d(board_flat)
+    r = find_drop_row(grid, move_col) if 0 <= move_col <= 6 else None
+    if r is None:
+        return True
+    grid[r][move_col] = mark
+    opp = 3 - mark
+    # Check if opponent has immediate winning reply
+    new_board = [grid[i][j] for i in range(6) for j in range(7)]
+    for c in agent.get_valid_actions(new_board):
+        if is_winning_move(new_board, c, opp):
+            return True
+    return False
+
+def safe_moves(board_flat, mark, valid_actions, agent):
+    """Return moves that don't give opponent immediate win."""
+    return [a for a in valid_actions if not if_i_will_lose_at_next(board_flat, a, mark, agent)]
+
+# ===== Shared Opponent Strategies =====
+
+def random_opponent_strategy(board_flat, mark, valid_actions, agent):
+    """Random opponent with basic tactics."""
+    c = if_i_can_win(board_flat, mark, agent)
+    if c is not None:
+        return c
+    c = if_i_will_lose(board_flat, mark, agent)
+    if c is not None:
+        return c
+    safe = safe_moves(board_flat, mark, valid_actions, agent)
+    if safe:
+        return random.choice(safe)
+    return random.choice(valid_actions)
+
+def minimax_opponent_strategy(board_flat, mark, valid_actions, agent, depth=3):
+    """Minimax opponent implementation."""
+    def score_window(window, mark):
+        opp = 3 - mark
+        cnt_self = window.count(mark)
+        cnt_opp = window.count(opp)
+        cnt_empty = window.count(0)
+        if cnt_self > 0 and cnt_opp > 0:
+            return 0
+        score = 0
+        if cnt_self == 4:
+            score += 10000
+        elif cnt_self == 3 and cnt_empty == 1:
+            score += 100
+        elif cnt_self == 2 and cnt_empty == 2:
+            score += 10
+        if cnt_opp == 3 and cnt_empty == 1:
+            score -= 120
+        return score
+
+    def evaluate_board(board_flat, mark):
+        grid = flat_to_2d(board_flat)
+        score = 0
+        # center preference
+        center_col = [grid[r][3] for r in range(6)]
+        score += center_col.count(mark) * 3
+        # Horizontal
+        for r in range(6):
+            row = grid[r]
+            for c in range(4):
+                window = row[c:c+4]
+                score += score_window(window, mark)
+        # Vertical
+        for c in range(7):
+            col = [grid[r][c] for r in range(6)]
+            for r in range(3):
+                window = col[r:r+4]
+                score += score_window(window, mark)
+        # Diagonals
+        for r in range(3):
+            for c in range(4):
+                window = [grid[r+i][c+i] for i in range(4)]
+                score += score_window(window, mark)
+        for r in range(3, 6):
+            for c in range(4):
+                window = [grid[r-i][c+i] for i in range(4)]
+                score += score_window(window, mark)
+        return score
+
+    def has_winner(board_flat, mark):
+        grid = flat_to_2d(board_flat)
+        for r in range(6):
+            for c in range(7):
+                if grid[r][c] != mark:
+                    continue
+                if is_win_from(grid, r, c, mark):
+                    return True
+        return False
+
+    def minimax(board_flat, depth, alpha, beta, current_mark, maximizing_mark):
+        valid_moves = agent.get_valid_actions(board_flat)
+        if depth == 0 or not valid_moves:
+            return evaluate_board(board_flat, maximizing_mark), None
+        
+        best_move = None
+        if current_mark == maximizing_mark:
+            value = -float('inf')
+            for c in valid_moves:
+                nb = apply_move(board_flat, c, current_mark)
+                if nb is None:
+                    continue
+                if has_winner(nb, current_mark):
+                    return 1e6 - (5 - depth), c
+                child_val, _ = minimax(nb, depth-1, alpha, beta, 3-current_mark, maximizing_mark)
+                if child_val > value:
+                    value, best_move = child_val, c
+                alpha = max(alpha, value)
+                if alpha >= beta:
+                    break
+            return value, best_move
+        else:
+            value = float('inf')
+            for c in valid_moves:
+                nb = apply_move(board_flat, c, current_mark)
+                if nb is None:
+                    continue
+                if has_winner(nb, current_mark):
+                    return -1e6 + (5 - depth), c
+                child_val, _ = minimax(nb, depth-1, alpha, beta, 3-current_mark, maximizing_mark)
+                if child_val < value:
+                    value, best_move = child_val, c
+                beta = min(beta, value)
+                if alpha >= beta:
+                    break
+            return value, best_move
+
+    # Check tactical moves first
+    c = if_i_can_win(board_flat, mark, agent)
+    if c is not None:
+        return c
+    c = if_i_will_lose(board_flat, mark, agent)
+    if c is not None:
+        return c
+    
+    # Use minimax
+    safe = safe_moves(board_flat, mark, valid_actions, agent)
+    moves = safe if safe else valid_actions
+    best_score = -float('inf')
+    best_move = random.choice(moves)
+    
+    for a in moves:
+        nb = apply_move(board_flat, a, mark)
+        if nb is None:
+            continue
+        score, _ = minimax(nb, depth-1, -float('inf'), float('inf'), 3-mark, mark)
+        if score > best_score:
+            best_score, best_move = score, a
+    return best_move
+
+def self_play_opponent_strategy(board_flat, mark, valid_actions, agent):
+    """Self-play opponent using current policy network."""
+    state = agent.encode_state(board_flat, mark)
+    action, _, _ = agent.select_action(state, valid_actions, training=False)
+    return int(action)
+
 # NEW: Worker function for collecting one episode in a separate process
 # It runs a lightweight copy of the PPOAgent on CPU to avoid GPU contention.
 def _worker_collect_episode(args):
@@ -79,13 +313,12 @@ def _worker_collect_episode(args):
         policy_state_np = args['policy_state']
         policy_state = {k: (torch.from_numpy(v) if isinstance(v, np.ndarray) else v) for k, v in policy_state_np.items()}
         player2_prob = args.get('player2_training_prob', 0.5)
-        use_tactical_opp = bool(args.get('use_tactical_opponent', False))
         seed = args.get('seed', None)
         if seed is not None:
             random.seed(seed)
             np.random.seed(seed)
             torch.manual_seed(seed)
-        print(f'player2_training_prob: {player2_training_prob}')
+        
         # Create a minimal agent on CPU and load weights
         agent = PPOAgent(cfg['agent'])
         agent.device = torch.device('cpu')
@@ -94,80 +327,15 @@ def _worker_collect_episode(args):
         agent.policy_net.load_state_dict(policy_state)
         agent.policy_net.eval()
 
-        # --- Tactical helpers (local to worker) ---
-        def flat_to_2d(board_flat):
-            try:
-                if isinstance(board_flat[0], list):
-                    return board_flat
-            except Exception:
-                pass
-            return [list(board_flat[r*7:(r+1)*7]) for r in range(6)]
-        def find_drop_row(grid, col):
-            for r in range(5, -1, -1):
-                if grid[r][col] == 0:
-                    return r
-            return None
-        def is_win_from(grid, r, c, mark):
-            dirs = [(1,0), (0,1), (1,1), (-1,1)]
-            for dr, dc in dirs:
-                cnt = 1
-                for s in (1, -1):
-                    rr, cc = r + dr*s, c + dc*s
-                    while 0 <= rr < 6 and 0 <= cc < 7 and grid[rr][cc] == mark:
-                        cnt += 1
-                        rr += dr*s
-                        cc += dc*s
-                if cnt >= 4:
-                    return True
-            return False
-        def is_winning_move(board_flat, col, mark):
-            grid = flat_to_2d(board_flat)
-            if col < 0 or col > 6:
-                return False
-            r = find_drop_row(grid, col)
-            if r is None:
-                return False
-            grid[r][col] = mark
-            return is_win_from(grid, r, col, mark)
-        def if_i_can_win(board_flat, mark):
-            for c in agent.get_valid_actions(board_flat):
-                if is_winning_move(board_flat, c, mark):
-                    return c
-            return None
-        def if_i_will_lose(board_flat, mark):
-            opp = 3 - mark
-            for c in agent.get_valid_actions(board_flat):
-                if is_winning_move(board_flat, c, opp):
-                    return c
-            return None
-        def if_i_will_lose_at_next(board_flat, move_col, mark):
-            grid = flat_to_2d(board_flat)
-            r = find_drop_row(grid, move_col) if 0 <= move_col <= 6 else None
-            if r is None:
-                return True
-            grid[r][move_col] = mark
-            opp = 3 - mark
-            # opponent immediate winning reply?
-            for c in agent.get_valid_actions([grid[i][j] for i in range(6) for j in range(7)]):
-                if is_winning_move([grid[i][j] for i in range(6) for j in range(7)], c, opp):
-                    return True
-            return False
-        def random_with_tactics(board_flat, mark, valid_actions):
-            c = if_i_can_win(board_flat, mark)
-            if c is not None:
-                return c
-            c = if_i_will_lose(board_flat, mark)
-            if c is not None:
-                return c
-            safe = [a for a in valid_actions if not if_i_will_lose_at_next(board_flat, a, mark)]
-            if safe:
-                return random.choice(safe)
-            return random.choice(valid_actions)
-
+        # === 開始遊戲 ===
         env = make('connectx', debug=False)
         env.reset()
 
-        # Choose which player to collect training transitions for (skewed towards player2 by config)
+        # 隨機選擇對手類型: 'random', 'minimax', 'self'
+        opponent_types = ['random', 'minimax', 'self']
+        opponent_type = random.choice(opponent_types)
+        
+        # 隨機選擇訓練玩家  
         p1_prob = 1.0 - float(player2_prob)
         training_player = int(np.random.choice([1, 2], p=[p1_prob, player2_prob]))
 
@@ -182,25 +350,40 @@ def _worker_collect_episode(args):
                     if env.state[player_idx]['status'] == 'ACTIVE':
                         board, current_player = agent.extract_board_and_mark(env.state, player_idx)
                         valid_actions = agent.get_valid_actions(board)
-                        if use_tactical_opp and current_player != training_player:
-                            action = random_with_tactics(board, current_player, valid_actions)
-                            prob = 1.0 / max(1, len(valid_actions))
-                            value = 0.0
-                        else:
+                        
+                        if current_player == training_player:
+                            # 訓練玩家使用策略網路
                             state = agent.encode_state(board, current_player)
                             action, prob, value = agent.select_action(state, valid_actions, training=True)
-                        if current_player == training_player:
+                            
+                            # 記錄transition
                             transitions.append({
                                 'state': agent.encode_state(board, current_player),
                                 'action': int(action),
                                 'prob': float(prob),
                                 'value': float(value),
                                 'training_player': training_player,
-                                'is_dangerous': bool(if_i_will_lose_at_next(board, int(action), current_player)) if use_tactical_opp else False
+                                'opponent_type': opponent_type,
+                                'is_dangerous': bool(if_i_will_lose_at_next(board, int(action), current_player, agent))
                             })
+                        else:
+                            # 對手使用選定的策略
+                            if opponent_type == 'random':
+                                action = random_opponent_strategy(board, current_player, valid_actions, agent)
+                            elif opponent_type == 'minimax':
+                                action = minimax_opponent_strategy(board, current_player, valid_actions, agent, depth=3)
+                            elif opponent_type == 'self':
+                                action = self_play_opponent_strategy(board, current_player, valid_actions, agent)
+                            else:
+                                action = random.choice(valid_actions)
+                            
+                            prob = 1.0 / max(1, len(valid_actions))
+                            value = 0.0
+                        
                         actions.append(int(action))
                     else:
                         actions.append(0)
+                
                 try:
                     env.step(actions)
                 except Exception:
@@ -216,7 +399,8 @@ def _worker_collect_episode(args):
             'transitions': transitions,
             'training_player': training_player,
             'player_result': player_result,
-            'game_length': len(transitions)
+            'game_length': len(transitions),
+            'opponent_type': opponent_type
         }
     except Exception as e:
         # In workers, avoid heavy logging; return empty result on failure
@@ -225,6 +409,7 @@ def _worker_collect_episode(args):
             'training_player': 1,
             'player_result': 0,
             'game_length': 0,
+            'opponent_type': 'unknown',
             'error': str(e)
         }
 
@@ -256,6 +441,8 @@ class ConnectXNet(nn.Module):
 
     def __init__(self, input_size=126, hidden_size=192, num_layers=256, drop_path_rate: float = 0.08, attn_every: int = 4):
         super().__init__()
+
+        print(f'input_size: {input_size}, hidden_size: {hidden_size}')
         # Clamp depth
         max_blocks = 32
         blocks = int(num_layers) if isinstance(num_layers, int) else max_blocks
@@ -555,33 +742,46 @@ class PPOAgent:
         fraction = self.partial_reset_fraction if fraction is None else float(fraction)
         net: ConnectXNet = self.policy_net  # type: ignore
         reset_count = 0
-        # Reset a random subset of residual blocks
+        
+        # Reset a random subset of trunk blocks
         if which in ('res_blocks', 'res_blocks_and_head'):
-            blocks = list(net.res_blocks)
+            trunk_blocks = list(net.trunk)
             import random as _rnd
-            k = max(1, int(len(blocks) * max(0.0, min(1.0, fraction))))
-            idxs = _rnd.sample(range(len(blocks)), k)
+            k = max(1, int(len(trunk_blocks) * max(0.0, min(1.0, fraction))))
+            idxs = _rnd.sample(range(len(trunk_blocks)), k)
             for i in idxs:
-                block = blocks[i]
-                # block = [Conv2d, GroupNorm, ReLU, Conv2d, GroupNorm]
-                for m in block:
+                block = trunk_blocks[i]
+                # Reinitialize parameters for this block
+                for m in block.modules():
                     if isinstance(m, nn.Conv2d):
-                        self._reinit_conv(m)
+                        nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                        if m.bias is not None:
+                            nn.init.zeros_(m.bias)
+                    elif isinstance(m, nn.Linear):
+                        nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+                        if m.bias is not None:
+                            nn.init.zeros_(m.bias)
                     elif isinstance(m, nn.GroupNorm):
-                        self._reinit_groupnorm(m)
-                self._clear_optimizer_state_for(block)
+                        if m.weight is not None:
+                            nn.init.ones_(m.weight)
+                        if m.bias is not None:
+                            nn.init.zeros_(m.bias)
                 reset_count += 1
-        # Optionally reset head (Linear -> ReLU -> Dropout) and policy head
+        
+        # Optionally reset head and policy head
         if which in ('head', 'res_blocks_and_head'):
-            for m in net.head:
+            for m in net.head.modules():
                 if isinstance(m, nn.Linear):
-                    self._reinit_linear(m)
-            for m in net.policy_head:
+                    nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+            for m in net.policy_head.modules():
                 if isinstance(m, nn.Linear):
-                    self._reinit_linear(m)
-            # Value head left intact to preserve value estimates, but can be reset if desired
-            self._clear_optimizer_state_for(net.head)
-            self._clear_optimizer_state_for(net.policy_head)
+                    nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+            # Value head left intact to preserve value estimates
+        
         try:
             logger.info(f"🔄 Partial reset applied: which={which}, fraction={fraction:.2f}, reset_blocks={reset_count}")
         except Exception:
@@ -733,56 +933,28 @@ class ConnectXTrainer:
         # 創建目錄
         os.makedirs('checkpoints', exist_ok=True)
         os.makedirs('logs', exist_ok=True)
+        # --- 新增：停滯偵測狀態 ---
+        from collections import deque as _dq
+        self._stagnation_scores = _dq(maxlen=50)  # 最近評估分數緩衝
+        self._best_score_seen = -1.0
+        self._best_score_episode = 0
+        self._last_stagnation_handle_ep = -10**9
 
-    # --- Board helpers (6x7) ---
+    # --- Board helpers (6x7) - using shared functions ---
     def _flat_to_2d(self, board_flat):
-        try:
-            if isinstance(board_flat[0], list):
-                # already 2d
-                return board_flat
-        except Exception:
-            pass
-        return [list(board_flat[r*7:(r+1)*7]) for r in range(6)]
+        return flat_to_2d(board_flat)
 
     def _find_drop_row(self, grid, col):
-        for r in range(5, -1, -1):
-            if grid[r][col] == 0:
-                return r
-        return None
+        return find_drop_row(grid, col)
 
     def _apply_move(self, board_flat, col, mark):
-        grid = self._flat_to_2d(board_flat)
-        if col < 0 or col > 6:
-            return None
-        r = self._find_drop_row(grid, col)
-        if r is None:
-            return None
-        grid[r][col] = mark
-        return [grid[i][j] for i in range(6) for j in range(7)]
+        return apply_move(board_flat, col, mark)
 
     def _is_win_from(self, grid, r, c, mark):
-        dirs = [(1,0), (0,1), (1,1), (-1,1)]
-        for dr, dc in dirs:
-            cnt = 1
-            for s in (1, -1):
-                rr, cc = r + dr*s, c + dc*s
-                while 0 <= rr < 6 and 0 <= cc < 7 and grid[rr][cc] == mark:
-                    cnt += 1
-                    rr += dr*s
-                    cc += dc*s
-                if cnt >= 4:
-                    return True
-        return False
+        return is_win_from(grid, r, c, mark)
 
     def _is_winning_move(self, board_flat, col, mark):
-        grid = self._flat_to_2d(board_flat)
-        if col < 0 or col > 6:
-            return False
-        r = self._find_drop_row(grid, col)
-        if r is None:
-            return False
-        grid[r][col] = mark
-        return self._is_win_from(grid, r, col, mark)
+        return is_winning_move(board_flat, col, mark)
 
     def _any_winning_moves(self, board_flat, mark):
         wins = []
@@ -791,50 +963,23 @@ class ConnectXTrainer:
                 wins.append(c)
         return wins
 
-    # --- Tactical utilities requested ---
+    # --- Tactical utilities - using shared functions ---
     def if_i_can_win(self, board_flat, mark):
-        for c in self.agent.get_valid_actions(board_flat):
-            if self._is_winning_move(board_flat, c, mark):
-                return c
-        return None
+        return if_i_can_win(board_flat, mark, self.agent)
 
     def if_i_will_lose(self, board_flat, mark):
-        opp = 3 - mark
-        for c in self.agent.get_valid_actions(board_flat):
-            if self._is_winning_move(board_flat, c, opp):
-                return c
-        return None
+        return if_i_will_lose(board_flat, mark, self.agent)
 
     def if_i_will_lose_at_next(self, board_flat, move_col, mark):
-        opp = 3 - mark
-        next_board = self._apply_move(board_flat, move_col, mark)
-        if next_board is None:
-            return True
-        for c in self.agent.get_valid_actions(next_board):
-            if self._is_winning_move(next_board, c, opp):
-                return True
-        return False
+        return if_i_will_lose_at_next(board_flat, move_col, mark, self.agent)
 
     # NEW: list all moves that do NOT give opponent an immediate winning reply
     def _safe_moves(self, board_flat, mark, valid_actions):
-        return [a for a in valid_actions if not self.if_i_will_lose_at_next(board_flat, a, mark)]
+        return safe_moves(board_flat, mark, valid_actions, self.agent)
 
-    # Tactical-aware random opponent move
+    # Tactical-aware random opponent move - using shared function
     def _random_with_tactics(self, board_flat, mark, valid_actions):
-        # 1) Immediate win
-        c = self.if_i_can_win(board_flat, mark)
-        if c is not None:
-            return c
-        # 2) Must block opponent win
-        c = self.if_i_will_lose(board_flat, mark)
-        if c is not None:
-            return c
-        # 3) Avoid blunders if possible
-        safe = self._safe_moves(board_flat, mark, valid_actions)
-        if safe:
-            return random.choice(safe)
-        # 4) Fallback to any
-        return random.choice(valid_actions)
+        return random_opponent_strategy(board_flat, mark, valid_actions, self.agent)
 
     # --- Random opening tactic for first player (mark==1) ---
     def _random_opening_move(self, board_flat, mark, valid_actions):
@@ -886,24 +1031,24 @@ class ConnectXTrainer:
             return random.choice(safe)
         return random.choice(valid_actions)
 
-    # --- Unified tactical + opening random opponent ---
+    # --- Unified tactical + opening random opponent - using shared functions ---
     def _tactical_random_opening_agent(self, board_flat, mark, valid_actions):
         """Priority: win -> block -> (if starter opening) -> safe move -> random.
         Adds safe-move layer to avoid handing immediate wins to opponent."""
         # Win if possible
-        c = self.if_i_can_win(board_flat, mark)
+        c = if_i_can_win(board_flat, mark, self.agent)
         if c is not None:
             return c
         # Block if necessary
-        c = self.if_i_will_lose(board_flat, mark)
+        c = if_i_will_lose(board_flat, mark, self.agent)
         if c is not None:
             return c
         # If starter, try opening move (but reject if unsafe)
         move = self._random_opening_move(board_flat, mark, valid_actions)
-        if move is not None and not self.if_i_will_lose_at_next(board_flat, move, mark):
+        if move is not None and not if_i_will_lose_at_next(board_flat, move, mark, self.agent):
             return move
         # Safe moves filter
-        safe = self._safe_moves(board_flat, mark, valid_actions)
+        safe = safe_moves(board_flat, mark, valid_actions, self.agent)
         if safe:
             return random.choice(safe)
         # Fallback to random
@@ -941,175 +1086,76 @@ class ConnectXTrainer:
             return 0
 
     # --- Minimax opponent for evaluation ---
-    def _score_window(self, window, mark):
-        opp = 3 - mark
-        cnt_self = window.count(mark)
-        cnt_opp = window.count(opp)
-        cnt_empty = window.count(0)
-        if cnt_self > 0 and cnt_opp > 0:
-            return 0
-        score = 0
-        if cnt_self == 4:
-            score += 10000
-        elif cnt_self == 3 and cnt_empty == 1:
-            score += 100
-        elif cnt_self == 2 and cnt_empty == 2:
-            score += 10
-        if cnt_opp == 3 and cnt_empty == 1:
-            score -= 120
-        return score
-
-    def _evaluate_board(self, board_flat, mark):
-        grid = self._flat_to_2d(board_flat)
-        score = 0
-        # center preference
-        center_col = [grid[r][3] for r in range(6)]
-        score += center_col.count(mark) * 3
-        # Horizontal
-        for r in range(6):
-            row = grid[r]
-            for c in range(4):
-                window = row[c:c+4]
-                score += self._score_window(window, mark)
-        # Vertical
-        for c in range(7):
-            col = [grid[r][c] for r in range(6)]
-            for r in range(3):
-                window = col[r:r+4]
-                score += self._score_window(window, mark)
-        # Diagonals
-        for r in range(3):
-            for c in range(4):
-                window = [grid[r+i][c+i] for i in range(4)]
-                score += self._score_window(window, mark)
-        for r in range(3, 6):
-            for c in range(4):
-                window = [grid[r-i][c+i] for i in range(4)]
-                score += self._score_window(window, mark)
-        return score
-
-    def _has_winner(self, board_flat, mark):
-        grid = self._flat_to_2d(board_flat)
-        # check all
-        for r in range(6):
-            for c in range(7):
-                if grid[r][c] != mark:
-                    continue
-                if self._is_win_from(grid, r, c, mark):
-                    return True
-        return False
-
-    def _minimax(self, board_flat, depth, alpha, beta, current_mark, maximizing_mark):
-        valid_moves = self.agent.get_valid_actions(board_flat)
-        if depth == 0 or not valid_moves:
-            return self._evaluate_board(board_flat, maximizing_mark), None
-        # Terminal strong checks: if previous player already has a winning move next, skip handled at callers
-        best_move = None
-        if current_mark == maximizing_mark:
-            value = -float('inf')
-            for c in valid_moves:
-                nb = self._apply_move(board_flat, c, current_mark)
-                if nb is None:
-                    continue
-                # immediate win
-                if self._has_winner(nb, current_mark):
-                    return 1e6 - (5 - depth), c
-                child_val, _ = self._minimax(nb, depth-1, alpha, beta, 3-current_mark, maximizing_mark)
-                if child_val > value:
-                    value, best_move = child_val, c
-                alpha = max(alpha, value)
-                if alpha >= beta:
-                    break
-            return value, best_move
-        else:
-            value = float('inf')
-            for c in valid_moves:
-                nb = self._apply_move(board_flat, c, current_mark)
-                if nb is None:
-                    continue
-                if self._has_winner(nb, current_mark):
-                    return -1e6 + (5 - depth), c
-                child_val, _ = self._minimax(nb, depth-1, alpha, beta, 3-current_mark, maximizing_mark)
-                if child_val < value:
-                    value, best_move = child_val, c
-                beta = min(beta, value)
-                if alpha >= beta:
-                    break
-            return value, best_move
-
     def _choose_minimax_move(self, board_flat, mark, max_depth):
-        # Tactical overrides
-        c = self.if_i_can_win(board_flat, mark)
-        if c is not None:
-            return c
-        c = self.if_i_will_lose(board_flat, mark)
-        if c is not None:
-            return c
+        # Use shared minimax strategy
         valid = self.agent.get_valid_actions(board_flat)
-        safe = [a for a in valid if not self.if_i_will_lose_at_next(board_flat, a, mark)]
-        moves = safe if safe else valid
-        # Try each candidate with shallow minimax to break ties
-        depth = max(1, min(4, int(self.config.get('evaluation', {}).get('minimax_depth', 3))))
-        best_score = -float('inf')
-        best_move = random.choice(moves)
-        for a in moves:
-            nb = self._apply_move(board_flat, a, mark)
-            if nb is None:
-                continue
-            score, _ = self._minimax(nb, depth-1, -float('inf'), float('inf'), 3-mark, mark)
-            if score > best_score:
-                best_score, best_move = score, a
-        return best_move
+        return minimax_opponent_strategy(board_flat, mark, valid, self.agent, depth=max_depth)
 
     def evaluate_against_random(self, games: int = 50):
         wins = 0
         draws = 0
-        for _ in range(max(1, int(games))):
-            r = self._play_one_game_vs_random()
-            if r == 1:
-                wins += 1
-            elif r == 0:
-                draws += 1
-        total = max(1, int(games))
-        return wins / total
+        total_games = max(1, int(games))
+        
+        for game_idx in range(total_games):
+            try:
+                r = self._play_one_game_vs_random()
+                if r == 1:
+                    wins += 1
+                elif r == 0:
+                    draws += 1
+            except Exception as e:
+                logger.warning(f"Game {game_idx} vs random failed: {e}")
+                continue
+                
+        win_rate = wins / total_games
+        logger.info(f"evaluate_against_random: {wins}/{total_games} wins, win_rate={win_rate:.3f}")
+        return win_rate
 
     def evaluate_against_minimax(self, games: int = 20):
         wins = 0
         draws = 0
-        for _ in range(max(1, int(games))):
-            env = make('connectx', debug=False)
-            env.reset()
-            moves = 0
-            with torch.no_grad():
-                while not env.done and moves < 50:
-                    actions = []
-                    for p in range(2):
-                        if env.state[p]['status'] == 'ACTIVE':
-                            board, mark = self.agent.extract_board_and_mark(env.state, p)
-                            state = self.agent.encode_state(board, mark)
-                            valid = self.agent.get_valid_actions(board)
-                            if p == 0:
-                                a, _, _ = self.agent.select_action(state, valid, training=False)
-                            else:
-                                a = self._choose_minimax_move(board, mark, max_depth=int(self.config.get('evaluation', {}).get('minimax_depth', 3)))
-                            actions.append(int(a))
-                        else:
-                            actions.append(0)
-                    try:
-                        env.step(actions)
-                    except Exception:
-                        break
-                    moves += 1
+        total_games = max(1, int(games))
+        
+        for game_idx in range(total_games):
             try:
-                res = env.state[0]['reward']
-                if res == 1:
-                    wins += 1
-                elif res == 0:
+                env = make('connectx', debug=False)
+                env.reset()
+                moves = 0
+                with torch.no_grad():
+                    while not env.done and moves < 50:
+                        actions = []
+                        for p in range(2):
+                            if env.state[p]['status'] == 'ACTIVE':
+                                board, mark = self.agent.extract_board_and_mark(env.state, p)
+                                state = self.agent.encode_state(board, mark)
+                                valid = self.agent.get_valid_actions(board)
+                                if p == 0:
+                                    a, _, _ = self.agent.select_action(state, valid, training=False)
+                                else:
+                                    a = self._choose_minimax_move(board, mark, max_depth=int(self.config.get('evaluation', {}).get('minimax_depth', 3)))
+                                actions.append(int(a))
+                            else:
+                                actions.append(0)
+                        try:
+                            env.step(actions)
+                        except Exception:
+                            break
+                        moves += 1
+                try:
+                    res = env.state[0]['reward']
+                    if res == 1:
+                        wins += 1
+                    elif res == 0:
+                        draws += 1
+                except Exception:
                     draws += 1
-            except Exception:
-                draws += 1
-        total = max(1, int(games))
-        return wins / total
+            except Exception as e:
+                logger.warning(f"Game {game_idx} vs minimax failed: {e}")
+                continue
+                
+        win_rate = wins / total_games
+        logger.info(f"evaluate_against_minimax: {wins}/{total_games} wins, win_rate={win_rate:.3f}")
+        return win_rate
 
     def evaluate_with_metrics(self, games: int = 50):
         wins = 0
@@ -1166,11 +1212,11 @@ class ConnectXTrainer:
 
     def _choose_policy_with_tactics(self, board_flat, mark, valid_actions, training=False):
         # 先看是否能直接贏
-        c = self.if_i_can_win(board_flat, mark)
+        c = if_i_can_win(board_flat, mark, self.agent)
         if c is not None:
             return c
         # 再看是否必須擋下對方
-        c = self.if_i_will_lose(board_flat, mark)
+        c = if_i_will_lose(board_flat, mark, self.agent)
         if c is not None:
             return c
         # 用策略網路選擇
@@ -1178,8 +1224,8 @@ class ConnectXTrainer:
         a, _, _ = self.agent.select_action(state, valid_actions, training=training)
         a = int(a)
         # 避免立即送給對手致勝
-        if self.if_i_will_lose_at_next(board_flat, a, mark):
-            safe = [x for x in valid_actions if not self.if_i_will_lose_at_next(board_flat, x, mark)]
+        if if_i_will_lose_at_next(board_flat, a, mark, self.agent):
+            safe = safe_moves(board_flat, mark, valid_actions, self.agent)
             if safe:
                 return random.choice(safe)
         return a
@@ -1237,19 +1283,46 @@ class ConnectXTrainer:
         """評估我方作為後手(玩家2)時的勝率，對手採戰術規則。"""
         wins = 0
         draws = 0
-        for _ in range(max(1, int(games))):
-            r = self._play_one_game_self_tactical(main_as_player1=False)
-            if r == 1:
-                wins += 1
-            elif r == 0:
-                draws += 1
-        return wins / max(1, int(games))
+        total_games = max(1, int(games))
+        
+        for game_idx in range(total_games):
+            try:
+                r = self._play_one_game_self_tactical(main_as_player1=False)
+                if r == 1:
+                    wins += 1
+                elif r == 0:
+                    draws += 1
+            except Exception as e:
+                logger.warning(f"Game {game_idx} self_play_player2 failed: {e}")
+                continue
+                
+        win_rate = wins / total_games
+        logger.info(f"evaluate_self_play_player2_focus: {wins}/{total_games} wins, win_rate={win_rate:.3f}")
+        return win_rate
 
     def evaluate_comprehensive(self, games: int = 50):
-        vs_random = self.evaluate_against_random(games)
-        vs_minimax = self.evaluate_against_minimax(max(1, games // 2))
-        # 自我對戰分兩種：先手與後手焦點，這裡使用後手焦點以鼓勵後手能力
-        self_play = self.evaluate_self_play_player2_focus(max(1, games // 2))
+        try:
+            vs_random = self.evaluate_against_random(games)
+            logger.info(f"vs_random result: {vs_random}")
+        except Exception as e:
+            logger.warning(f"evaluate_against_random failed: {e}")
+            vs_random = 0.0
+            
+        try:
+            vs_minimax = self.evaluate_against_minimax(max(1, games // 2))
+            logger.info(f"vs_minimax result: {vs_minimax}")
+        except Exception as e:
+            logger.warning(f"evaluate_against_minimax failed: {e}")
+            vs_minimax = 0.0
+            
+        try:
+            # 自我對戰分兩種：先手與後手焦點，這裡使用後手焦點以鼓勵後手能力
+            self_play = self.evaluate_self_play_player2_focus(max(1, games // 2))
+            logger.info(f"self_play result: {self_play}")
+        except Exception as e:
+            logger.warning(f"evaluate_self_play_player2_focus failed: {e}")
+            self_play = 0.0
+            
         # 權重（若配置有提供）
         weights = self.config.get('evaluation', {}).get('weights', {})
         w_self = float(weights.get('self_play', 0.4))
@@ -1257,18 +1330,156 @@ class ConnectXTrainer:
         w_random = float(weights.get('vs_random', 0.2))
         total_w = max(1e-6, w_self + w_minimax + w_random)
         comprehensive = (w_self * self_play + w_minimax * vs_minimax + w_random * vs_random) / total_w
-        # --- Hook: consider reset by win rate ---
-        try:
-            # Use comprehensive score as proxy of win rate
-            self.consider_reset_by_win_rate(comprehensive)
-        except Exception:
-            pass
+        
         return {
             'vs_random': vs_random,
             'vs_minimax': vs_minimax,
             'self_play': self_play,
             'comprehensive_score': comprehensive,
         }
+
+    # --- Stagnation detection / handling ---
+    def _detect_convergence_stagnation(self, current_episode: int, current_score: float) -> bool:
+        """偵測是否進入收斂停滯狀態。
+        條件(滿足任一核心條件 + 基本條件)：
+          1. 最近窗口(score_window)的分數波動範圍過小 (range < range_threshold)
+          2. 已經超過 patience_episodes 仍沒有刷新最佳分數
+          3. 分數長期低於 low_score_threshold (平均值 < 該值 且 episode >= min_episode_start)
+        觸發後由 _handle_convergence_stagnation 執行部分權重重置與探索增強。
+        """
+        cfg = self.config.get('stagnation', {}) if isinstance(self.config, dict) else {}
+        window_size = int(cfg.get('window', 10))
+        range_threshold = float(cfg.get('range_threshold', 0.02))
+        patience_eps = int(cfg.get('patience_episodes', 800))
+        low_score_threshold = float(cfg.get('low_score_threshold', 0.35))
+        min_episode_start = int(cfg.get('min_episode_start', 500))
+        cooldown_eps = int(cfg.get('cooldown_episodes', 800))
+
+        # 更新狀態
+        self._stagnation_scores.append(float(current_score))
+        if current_score > self._best_score_seen + 1e-6:
+            self._best_score_seen = float(current_score)
+            self._best_score_episode = int(current_episode)
+
+        # 冷卻未過不再觸發
+        if current_episode - self._last_stagnation_handle_ep < cooldown_eps:
+            return False
+
+        if len(self._stagnation_scores) < max(5, window_size):
+            return False
+
+        recent = list(self._stagnation_scores)[-window_size:]
+        r_min, r_max = min(recent), max(recent)
+        r_range = r_max - r_min
+        avg_recent = sum(recent) / len(recent)
+
+        no_improve_eps = current_episode - self._best_score_episode
+
+        cond_small_range = (r_range < range_threshold)
+        cond_patience = (no_improve_eps >= patience_eps and current_episode >= min_episode_start)
+        cond_low = (avg_recent < low_score_threshold and current_episode >= min_episode_start)
+
+        triggered = (cond_small_range or cond_patience or cond_low)
+        if triggered:
+            try:
+                logger.info(
+                    f"⚠️ 偵測到可能停滯: eps={current_episode} score={current_score:.3f} "
+                    f"range={r_range:.4f} avg={avg_recent:.3f} no_improve={no_improve_eps} "
+                    f"(range<{range_threshold}? {cond_small_range}, patience? {cond_patience}, low? {cond_low})"
+                )
+            except Exception:
+                pass
+        return triggered
+
+    def _handle_convergence_stagnation(self, current_episode: int):
+        """處理收斂停滯：部分重置模型權重、提升探索、適度調整學習率/清緩衝。
+        策略：
+          1. 使用 agent.partial_reset 重置部分殘差區塊與 head (依 reset_fraction)
+          2. 提升 entropy_coef（上限保護）鼓勵探索
+          3. 可選：輕微調整學習率(降低或回彈)；這裡採用 *0.9 讓重新搜索更穩定
+          4. 清空 PPO 記憶避免舊策略分佈干擾
+          5. 重置對應 optimizer state 以防遺留動量
+        """
+        cfg = self.config.get('stagnation', {}) if isinstance(self.config, dict) else {}
+        cooldown_eps = int(cfg.get('cooldown_episodes', 800))
+        reset_fraction = float(cfg.get('reset_fraction', 0.30))
+        entropy_boost = float(cfg.get('entropy_boost', 1.35))
+        entropy_max = float(cfg.get('entropy_max', 0.02))  # entropy_coef 通常很小，設定上限
+        lr_decay = float(cfg.get('lr_decay_factor', 0.9))
+        
+        min_gap_ok = (current_episode - self._last_stagnation_handle_ep) >= cooldown_eps
+        if not min_gap_ok:
+            return
+        
+        try:
+            logger.info(
+                f"🛠️ 執行停滯處理: episode={current_episode} reset_fraction={reset_fraction} entropy_boost={entropy_boost}"
+            )
+        except Exception:
+            pass
+        
+        # 1) 部分重置（若 agent 提供 partial_reset）
+        try:
+            if hasattr(self.agent, 'partial_reset'):
+                self.agent.partial_reset('res_blocks_and_head', fraction=reset_fraction)
+            else:
+                # 後備：手動挑選部分層重新初始化
+                import random
+                import math
+                modules = []
+                for m in self.agent.policy_net.modules():  # type: ignore
+                    if isinstance(m, (torch.nn.Conv2d, torch.nn.Linear)) and m.weight.requires_grad:
+                        modules.append(m)
+                random.shuffle(modules)
+                k = max(1, int(len(modules) * reset_fraction))
+                for m in modules[:k]:
+                    if isinstance(m, torch.nn.Conv2d):
+                        torch.nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                    else:
+                        torch.nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+                    if m.bias is not None:
+                        torch.nn.init.zeros_(m.bias)
+        except Exception as e:
+            try:
+                logger.warning(f"部分重置過程出錯: {e}")
+            except Exception:
+                pass
+        
+        # 2) 增加探索: entropy_coef 乘以 boost (有上限)
+        try:
+            if hasattr(self.agent, 'entropy_coef'):
+                new_entropy = min(entropy_max, getattr(self.agent, 'entropy_coef', 0.0) * entropy_boost + 1e-12)
+                self.agent.entropy_coef = new_entropy
+                logger.info(f"🔄 entropy_coef -> {new_entropy:.6f}")
+        except Exception:
+            pass
+        
+        # 3) 調整學習率（全部 param group）
+        try:
+            for pg in self.agent.optimizer.param_groups:  # type: ignore
+                old_lr = pg.get('lr', 0.0)
+                pg['lr'] = max(1e-6, old_lr * lr_decay)
+            logger.info("📉 已調整學習率 (乘以 lr_decay_factor)")
+        except Exception:
+            pass
+        
+        # 4) 清空記憶 / 5) 清 optimizer state (只保留必要結構)
+        try:
+            if hasattr(self.agent, 'memory'):
+                self.agent.memory.clear()
+            # 重建 optimizer 來清動量
+            opt_cls = type(self.agent.optimizer)
+            self.agent.optimizer = opt_cls(self.agent.policy_net.parameters(), **self.agent.optimizer.defaults)  # type: ignore
+        except Exception:
+            pass
+        
+        # 6) 更新冷卻標記
+        self._last_stagnation_handle_ep = int(current_episode)
+        try:
+            logger.info("✅ 停滯處理完成，進入冷卻階段。")
+        except Exception:
+            pass
+        return
 
     # ------------------------------
     # Checkpoint I/O utilities
@@ -1348,31 +1559,6 @@ class ConnectXTrainer:
         except Exception as e:
             logger.error(f"載入檢查點時出錯: {e}")
             return False
-
-    def fix_checkpoint_compatibility(self, old_checkpoint_path: str, new_checkpoint_path: str | None = None):
-        """修復舊檢查點的兼容性問題，返回新檔案路徑或None"""
-        try:
-            if new_checkpoint_path is None:
-                new_checkpoint_path = old_checkpoint_path.replace('.pt', '_fixed.pt')
-            logger.info(f"嘗試修復檢查點: {old_checkpoint_path}")
-            ckpt = torch.load(old_checkpoint_path, map_location='cpu')
-            # 常見修復：版本資訊轉字串
-            if isinstance(ckpt, dict) and 'pytorch_version' in ckpt and not isinstance(ckpt['pytorch_version'], str):
-                ckpt['pytorch_version'] = str(ckpt['pytorch_version'])
-            torch.save(ckpt, new_checkpoint_path)
-            logger.info(f"已保存修復後的檢查點: {new_checkpoint_path}")
-            return new_checkpoint_path
-        except Exception as e:
-            logger.error(f"修復檢查點失敗: {e}")
-            return None
-
-    # ------------------------------
-    # Minimal training stubs (prevent AttributeError)
-    # ------------------------------
-    def train(self):
-        """簡易訓練占位：目前僅回傳 agent 以避免流程中斷"""
-        logger.warning("train() 尚未實作完整訓練流程，暫時跳過並回傳當前模型。")
-        return self.agent
 
     def train_parallel(self):
         """平行蒐集 episode → 主行程更新 PPO → 週期評估/保存。"""
@@ -1498,8 +1684,8 @@ class ConnectXTrainer:
                         self.save_checkpoint(f"best_model_wr_{best_score:.3f}.pt")
 
                 # 週期性檢查點（避免在 Eps=0 觸發）
-                if checkpoint_frequency > 0 and episodes_done_total > 0 and episodes_done_total % checkpoint_frequency == 0:
-                    self.save_checkpoint(f"checkpoint_episode_{episodes_done_total}.pt")
+                # if checkpoint_frequency > 0 and episodes_done_total > 0 and episodes_done_total % checkpoint_frequency == 0:
+                #     self.save_checkpoint(f"checkpoint_episode_{episodes_done_total}.pt")
 
                 # 週期性可視化（避免在 Eps=0 觸發）
                 if (
@@ -1779,6 +1965,7 @@ def main():
             ckpt_to_load = choose_latest_checkpoint_by_name(files)
 
     logger.info(f"ckpt_to_load: {ckpt_to_load}")
+
     if ckpt_to_load:
         loaded = trainer.load_checkpoint(ckpt_to_load)
         if not loaded:

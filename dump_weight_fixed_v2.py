@@ -85,106 +85,20 @@ def choose_latest_checkpoint_by_name(files):
     return latest
 
 
-
-
-if __name__ == "__main__":
-    # 選最新的 checkpoint（依檔名帶時間戳或 mtime）或由參數指定
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Dump a ConnectX checkpoint to submission.py with embedded weights")
-    parser.add_argument(
-        "-m", "--model", type=str, default=None,
-        help="Path to a specific checkpoint .pt to dump (absolute or relative). If relative and not found, 'checkpoints/<name>' will be tried."
-    )
-    args = parser.parse_args()
-
-    ckpt_files = glob.glob(os.path.join("checkpoints", "*.pt"))
-
-    selected = None
-    if args.model:
-        candidate = args.model
-        # If provided is not absolute, try as-is then under checkpoints/
-        tried = []
-        if os.path.isabs(candidate):
-            tried.append(candidate)
-        else:
-            tried.extend([candidate, os.path.join("checkpoints", candidate)])
-        for p in tried:
-            if os.path.isfile(p):
-                selected = p
-                break
-        if selected is None:
-            print(f"❌ 指定的檔案不存在: {candidate}")
-            if ckpt_files:
-                print("可用的檢查點有:")
-                for p in sorted(ckpt_files):
-                    print(" -", p)
-            sys.exit(1)
-    else:
-        if not ckpt_files and not os.path.isfile(PREFERRED_CKPT):
-            print("❌ 找不到可用的檢查點 (*.pt)。請確認 checkpoints 目錄下有有效檔案。")
-            sys.exit(1)
-        if ckpt_files:
-            selected = choose_latest_checkpoint_by_name(ckpt_files)
-        elif os.path.isfile(PREFERRED_CKPT):
-            selected = PREFERRED_CKPT
-
-    path = selected
-    print(f"📦 使用檢查點: {path}")
-    ckpt = try_load_checkpoint(path)
-
-    if ckpt is None:
-        # 如果使用者明確指定了 checkpoint，就直接報錯；否則嘗試 fallback 尋找
-        if args.model:
-            print("❌ 無法載入指定的檢查點。")
-            sys.exit(1)
-        path, ckpt = find_working_checkpoint()
-        if ckpt is None:
-            print("❌ 仍然無法載入任何檢查點。")
-            sys.exit(1)
-
-    try:
-        state_dict = extract_state_dict(ckpt)
-    except Exception as e:
-        print(f"❌ 解析檢查點失敗: {e}")
-        sys.exit(1)
-   
-    # 只保留張量權重並轉為 numpy
-    np_state = {}
-    for k, v in state_dict.items():
-        try:
-            if isinstance(v, torch.Tensor):
-                np_state[k] = v.detach().cpu().numpy()
-            elif isinstance(v, np.ndarray):
-                np_state[k] = v
-            else:
-                # 跳過非張量權重
-                continue
-        except Exception as e:
-            print(f"⚠️  轉換權重失敗 {k}: {e}")
-
-    out_npz = "model_weights.npz"
-    np.savez_compressed(out_npz, **np_state)
-    print(f"✅ 已輸出權重: {out_npz}  (包含 {len(np_state)} 個張量)")
-
-    # 內嵌到 submission.py
-    with open(out_npz, "rb") as f:
-        weights_b64 = base64.b64encode(f.read()).decode("utf-8")
-
-    # Detect architecture type (old simple CNN vs new advanced trunk)
-    has_trunk = any(k.startswith('trunk.') for k in np_state.keys())
-
+def generate_submission_code(weights_b64, has_trunk):
+    """生成 submission.py 代碼"""
+    
     if has_trunk:
-        arch_comment = "# Advanced architecture: BottleneckSE blocks + optional SpatialSelfAttention + coord embeddings"
-        submission_code = f'''import numpy as np
+        # 高級架構
+        code = '''import numpy as np
 import base64, io
-{arch_comment}
-WEIGHTS_B64 = "{weights_b64}"
+# Advanced architecture: BottleneckSE blocks + optional SpatialSelfAttention + coord embeddings
+WEIGHTS_B64 = "''' + weights_b64 + '''"
 
 def load_weights():
     buf = io.BytesIO(base64.b64decode(WEIGHTS_B64))
     data = np.load(buf)
-    return {{k: data[k] for k in data.files}}
+    return {k: data[k] for k in data.files}
 weights = load_weights()
 
 # ---------------- Tactical helpers ----------------
@@ -296,7 +210,7 @@ def linear(x, w, b):
 _trunk_indices = sorted(set(int(k.split('.')[1]) for k in weights if k.startswith('trunk.') ))
 _is_attn = {}
 for idx in _trunk_indices:
-    _is_attn[idx] = f'trunk.{idx}.qkv.weight' in weights
+    _is_attn[idx] = 'trunk.' + str(idx) + '.qkv.weight' in weights
 
 # Infer channels / hidden
 stem_w = weights['stem.0.weight']
@@ -305,9 +219,7 @@ hidden = weights['head.1.weight'].shape[0]
 half_hidden = hidden//2
 
 # Precompute coord planes (-1..1)
-_row = np.linspace(-1,1,6).reshape(6,1).repeat(7,1)
-_col = np.linspace(-1,1,7).reshape(1,7).repeat(6,0)
-# fix _col repeat usage: correct creation
+_row = np.tile(np.linspace(-1,1,6).reshape(6,1), (1,7))
 _col = np.tile(np.linspace(-1,1,7), (6,1))
 
 def forward_pass(state):
@@ -323,7 +235,9 @@ def forward_pass(state):
     for idx in _trunk_indices:
         if _is_attn[idx]:
             # Spatial self-attention block: qkv 1x1 conv produce 3C
-            qkv = conv1x1(x, weights[f'trunk.{idx}.qkv.weight'], None)
+            qkv_key = 'trunk.' + str(idx) + '.qkv.weight'
+            proj_key = 'trunk.' + str(idx) + '.proj.weight'
+            qkv = conv1x1(x, weights[qkv_key], None)
             Bq = qkv.shape[0]//3
             q, k, v = np.split(qkv, 3, axis=0)
             # heads fixed to 4
@@ -342,23 +256,24 @@ def forward_pass(state):
                 out = attn @ vh[h].T  # (HW,dim)
                 out_heads.append(out.T)
             out = np.concatenate(out_heads, axis=0).reshape(C, q.shape[1], q.shape[2])
-            out = conv1x1(out, weights[f'trunk.{idx}.proj.weight'], None)
+            out = conv1x1(out, weights[proj_key], None)
             x = out  # no residual in original implementation
         else:
             # BottleneckSE
-            c1 = conv1x1(x, weights[f'trunk.{idx}.conv1.weight'], None)
-            c1 = group_norm(c1, weights[f'trunk.{idx}.gn1.weight'], weights[f'trunk.{idx}.gn1.bias'])
+            prefix = 'trunk.' + str(idx) + '.'
+            c1 = conv1x1(x, weights[prefix + 'conv1.weight'], None)
+            c1 = group_norm(c1, weights[prefix + 'gn1.weight'], weights[prefix + 'gn1.bias'])
             c1 = relu(c1)
-            c2 = conv2d(c1, weights[f'trunk.{idx}.conv2.weight'], None, pad=1)
-            c2 = group_norm(c2, weights[f'trunk.{idx}.gn2.weight'], weights[f'trunk.{idx}.gn2.bias'])
+            c2 = conv2d(c1, weights[prefix + 'conv2.weight'], None, pad=1)
+            c2 = group_norm(c2, weights[prefix + 'gn2.weight'], weights[prefix + 'gn2.bias'])
             c2 = relu(c2)
-            c3 = conv1x1(c2, weights[f'trunk.{idx}.conv3.weight'], None)
-            c3 = group_norm(c3, weights[f'trunk.{idx}.gn3.weight'], weights[f'trunk.{idx}.gn3.bias'])
+            c3 = conv1x1(c2, weights[prefix + 'conv3.weight'], None)
+            c3 = group_norm(c3, weights[prefix + 'gn3.weight'], weights[prefix + 'gn3.bias'])
             # SE
             se_vec = c3.mean(axis=(1,2))  # (C,)
             # fc1
-            w1 = weights[f'trunk.{idx}.se_fc1.weight']; b1 = weights[f'trunk.{idx}.se_fc1.bias']
-            w2 = weights[f'trunk.{idx}.se_fc2.weight']; b2 = weights[f'trunk.{idx}.se_fc2.bias']
+            w1 = weights[prefix + 'se_fc1.weight']; b1 = weights[prefix + 'se_fc1.bias']
+            w2 = weights[prefix + 'se_fc2.weight']; b2 = weights[prefix + 'se_fc2.bias']
             se_h = relu(se_vec @ w1.T + b1)
             se_s = 1/(1+np.exp(-(se_h @ w2.T + b2)))
             c3 = c3 * se_s.reshape(-1,1,1)
@@ -394,6 +309,57 @@ def encode_state(board, mark):
     e = (arr == 0).astype(np.float32)
     return np.concatenate([p.ravel(), o.ravel(), e.ravel()])
 
+# -------------- Safe action checker --------------
+
+def find_safe_action(board, mark, preferred_action, max_attempts=7):
+    """
+    檢查動作是否會讓對方下一步就勝利，如果會就隨機挑選其他動作
+    最多嘗試7次，如果都不安全就返回原動作
+    """
+    import random
+    
+    def will_opponent_win_next(board, action, mark):
+        # 模擬我方下這步棋
+        row = drop_row(board, action)
+        if row < 0:
+            return True  # 無效動作視為危險
+        
+        # 複製棋盤並下棋
+        temp_board = board[:]
+        temp_board[row * 7 + action] = mark
+        
+        # 檢查對方是否有即時獲勝機會
+        opponent_mark = 3 - mark
+        opponent_win = immediate_win(temp_board, opponent_mark)
+        return opponent_win != -1
+    
+    valids = get_valid_actions(board)
+    if not valids:
+        return 0
+    
+    # 如果首選動作是安全的，直接返回
+    if preferred_action in valids and not will_opponent_win_next(board, preferred_action, mark):
+        return preferred_action
+    
+    # 否則嘗試找到安全動作
+    attempted = set()
+    for _ in range(max_attempts):
+        # 隨機選擇一個還沒嘗試過的動作
+        available = [a for a in valids if a not in attempted]
+        if not available:
+            break
+            
+        action = random.choice(available)
+        attempted.add(action)
+        
+        if not will_opponent_win_next(board, action, mark):
+            return action
+    
+    # 如果7次都找不到安全動作，返回首選動作或隨機動作
+    if preferred_action in valids:
+        return preferred_action
+    return random.choice(valids) if valids else 0
+
 # -------------- Agent main --------------
 
 def my_agent(obs, config):
@@ -415,13 +381,321 @@ def my_agent(obs, config):
     if mask.sum() <= 0:
         safe = safe_moves(board, mark)
         if safe:
-            return int(np.random.choice(safe))
-        return int(valids[0])
-    mask /= mask.sum()
-    # Prefer safe moves with highest prob
-    s_moves = safe_moves(board, mark)
-    if s_moves:
-        best = max(s_moves, key=lambda c: mask[c])
-        return int(best)
-    return int(max(valids, key=lambda c: mask[c]))
+            preferred = int(np.random.choice(safe))
+        else:
+            preferred = int(valids[0])
+    else:
+        mask /= mask.sum()
+        # Prefer safe moves with highest prob
+        s_moves = safe_moves(board, mark)
+        if s_moves:
+            preferred = max(s_moves, key=lambda c: mask[c])
+        else:
+            preferred = max(valids, key=lambda c: mask[c])
+    
+    # 使用安全動作檢查器
+    final_action = find_safe_action(board, mark, preferred)
+    return int(final_action)
+'''
+    else:
+        # 簡單架構
+        code = '''import numpy as np
+import base64, io
+# Simple CNN architecture
+WEIGHTS_B64 = "''' + weights_b64 + '''"
+
+def load_weights():
+    buf = io.BytesIO(base64.b64decode(WEIGHTS_B64))
+    data = np.load(buf)
+    return {k: data[k] for k in data.files}
+weights = load_weights()
+
+# 戰術輔助函數（與高級版本相同）
+def get_valid_actions(board):
+    return [c for c in range(7) if board[c] == 0]
+
+def drop_row(board, col):
+    for r in range(5, -1, -1):
+        if board[r*7+col] == 0:
+            return r
+    return -1
+
+def check_win_after(board, mark, col):
+    row = drop_row(board, col)
+    if row < 0:
+        return False
+    b = board[:]
+    b[row*7+col] = mark
+    dirs = [(0,1),(1,0),(1,1),(1,-1)]
+    for dr, dc in dirs:
+        cnt = 1
+        for s in (1,-1):
+            rr, cc = row+dr*s, col+dc*s
+            while 0 <= rr < 6 and 0 <= cc < 7 and b[rr*7+cc] == mark:
+                cnt += 1
+                rr += dr*s; cc += dc*s
+        if cnt >= 4:
+            return True
+    return False
+
+def immediate_win(board, mark):
+    for c in get_valid_actions(board):
+        if check_win_after(board, mark, c):
+            return c
+    return -1
+
+def immediate_block(board, mark):
+    opp = 3-mark
+    for c in get_valid_actions(board):
+        if check_win_after(board, opp, c):
+            return c
+    return -1
+
+def gives_opp_win(board, move_col, mark):
+    opp = 3-mark
+    row = drop_row(board, move_col)
+    if row < 0:
+        return True
+    b = board[:]
+    b[row*7+move_col] = mark
+    for c in get_valid_actions(b):
+        if check_win_after(b, opp, c):
+            return True
+    return False
+
+def safe_moves(board, mark):
+    valids = get_valid_actions(board)
+    return [c for c in valids if not gives_opp_win(board, c, mark)]
+
+# 簡單神經網路函數
+def relu(x):
+    return np.maximum(0, x)
+
+def linear(x, w, b):
+    return x @ w.T + b
+
+def encode_state(board, mark):
+    # 簡單3平面編碼
+    arr = np.array(board).reshape(6,7)
+    p = (arr == mark).astype(np.float32)
+    o = (arr == (3-mark)).astype(np.float32)
+    e = (arr == 0).astype(np.float32)
+    return np.concatenate([p.ravel(), o.ravel(), e.ravel()])
+
+def forward_pass(state):
+    # 簡單MLP前向傳播
+    x = np.array(state, dtype=np.float32)
+    # 隱藏層
+    hidden_layers = sorted([k for k in weights.keys() if k.startswith('hidden')])
+    for layer_name in hidden_layers:
+        w = weights[layer_name + '.weight']
+        b = weights[layer_name + '.bias'] if layer_name + '.bias' in weights else np.zeros(w.shape[0])
+        x = relu(linear(x, w, b))
+    
+    # 輸出層
+    w_out = weights['output.weight']
+    b_out = weights['output.bias'] if 'output.bias' in weights else np.zeros(w_out.shape[0])
+    logits = linear(x, w_out, b_out)
+    
+    # Softmax
+    exp = np.exp(logits - np.max(logits))
+    probs = exp / (exp.sum() + 1e-8)
+    return probs
+
+# -------------- Safe action checker --------------
+
+def find_safe_action(board, mark, preferred_action, max_attempts=7):
+    """
+    檢查動作是否會讓對方下一步就勝利，如果會就隨機挑選其他動作
+    最多嘗試7次，如果都不安全就返回原動作
+    """
+    import random
+    
+    def will_opponent_win_next(board, action, mark):
+        # 模擬我方下這步棋
+        row = drop_row(board, action)
+        if row < 0:
+            return True  # 無效動作視為危險
+        
+        # 複製棋盤並下棋
+        temp_board = board[:]
+        temp_board[row * 7 + action] = mark
+        
+        # 檢查對方是否有即時獲勝機會
+        opponent_mark = 3 - mark
+        opponent_win = immediate_win(temp_board, opponent_mark)
+        return opponent_win != -1
+    
+    valids = get_valid_actions(board)
+    if not valids:
+        return 0
+    
+    # 如果首選動作是安全的，直接返回
+    if preferred_action in valids and not will_opponent_win_next(board, preferred_action, mark):
+        return preferred_action
+    
+    # 否則嘗試找到安全動作
+    attempted = set()
+    for _ in range(max_attempts):
+        # 隨機選擇一個還沒嘗試過的動作
+        available = [a for a in valids if a not in attempted]
+        if not available:
+            break
+            
+        action = random.choice(available)
+        attempted.add(action)
+        
+        if not will_opponent_win_next(board, action, mark):
+            return action
+    
+    # 如果7次都找不到安全動作，返回首選動作或隨機動作
+    if preferred_action in valids:
+        return preferred_action
+    return random.choice(valids) if valids else 0
+
+def my_agent(obs, config):
+    board = obs['board']; mark = obs['mark']
+    win = immediate_win(board, mark)
+    if win != -1:
+        return int(win)
+    block = immediate_block(board, mark)
+    if block != -1:
+        return int(block)
+    valids = get_valid_actions(board)
+    if not valids:
+        return 0
+    s = encode_state(board, mark)
+    probs = forward_pass(s)
+    # Mask invalid
+    mask = np.zeros_like(probs)
+    mask[valids] = probs[valids]
+    if mask.sum() <= 0:
+        safe = safe_moves(board, mark)
+        if safe:
+            preferred = int(np.random.choice(safe))
+        else:
+            preferred = int(valids[0])
+    else:
+        mask /= mask.sum()
+        # Prefer safe moves with highest prob
+        s_moves = safe_moves(board, mark)
+        if s_moves:
+            preferred = max(s_moves, key=lambda c: mask[c])
+        else:
+            preferred = max(valids, key=lambda c: mask[c])
+    
+    # 使用安全動作檢查器
+    final_action = find_safe_action(board, mark, preferred)
+    return int(final_action)
+'''
+    
+    return code
+
+
+if __name__ == "__main__":
+    # 選最新的 checkpoint（依檔名帶時間戳或 mtime）或由參數指定
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Dump a ConnectX checkpoint to submission.py with embedded weights")
+    parser.add_argument(
+        "-m", "--model", type=str, default=None,
+        help="Path to a specific checkpoint .pt to dump (absolute or relative). If relative and not found, 'checkpoints/<name>' will be tried."
+    )
+    args = parser.parse_args()
+
+    ckpt_files = glob.glob(os.path.join("checkpoints", "*.pt"))
+
+    selected = None
+    if args.model:
+        candidate = args.model
+        # If provided is not absolute, try as-is then under checkpoints/
+        tried = []
+        if os.path.isabs(candidate):
+            tried.append(candidate)
+        else:
+            tried.extend([candidate, os.path.join("checkpoints", candidate)])
+        for p in tried:
+            if os.path.isfile(p):
+                selected = p
+                break
+        if selected is None:
+            print(f"❌ 指定的檔案不存在: {candidate}")
+            if ckpt_files:
+                print("可用的檢查點有:")
+                for p in sorted(ckpt_files):
+                    print(" -", p)
+            sys.exit(1)
+    else:
+        if not ckpt_files and not os.path.isfile(PREFERRED_CKPT):
+            print("❌ 找不到可用的檢查點 (*.pt)。請確認 checkpoints 目錄下有有效檔案。")
+            sys.exit(1)
+        if ckpt_files:
+            selected = choose_latest_checkpoint_by_name(ckpt_files)
+        elif os.path.isfile(PREFERRED_CKPT):
+            selected = PREFERRED_CKPT
+
+    path = selected
+    print(f"📦 使用檢查點: {path}")
+    ckpt = try_load_checkpoint(path)
+
+    if ckpt is None:
+        # 如果使用者明確指定了 checkpoint，就直接報錯；否則嘗試 fallback 尋找
+        if args.model:
+            print("❌ 無法載入指定的檢查點。")
+            sys.exit(1)
+        path, ckpt = find_working_checkpoint()
+        if ckpt is None:
+            print("❌ 仍然無法載入任何檢查點。")
+            sys.exit(1)
+
+    try:
+        state_dict = extract_state_dict(ckpt)
+    except Exception as e:
+        print(f"❌ 解析檢查點失敗: {e}")
+        sys.exit(1)
+   
+    # 只保留張量權重並轉為 numpy
+    np_state = {}
+    for k, v in state_dict.items():
+        try:
+            if isinstance(v, torch.Tensor):
+                np_state[k] = v.detach().cpu().numpy()
+            elif isinstance(v, np.ndarray):
+                np_state[k] = v
+            else:
+                # 跳過非張量權重
+                continue
+        except Exception as e:
+            print(f"⚠️  轉換權重失敗 {k}: {e}")
+
+    out_npz = "model_weights.npz"
+    np.savez_compressed(out_npz, **np_state)
+    print(f"✅ 已輸出權重: {out_npz}  (包含 {len(np_state)} 個張量)")
+
+    # 內嵌到 submission.py
+    with open(out_npz, "rb") as f:
+        weights_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    # Detect architecture type (old simple CNN vs new advanced trunk)
+    has_trunk = any(k.startswith('trunk.') for k in np_state.keys())
+    
+    # 生成 submission 代碼
+    submission_code = generate_submission_code(weights_b64, has_trunk)
+
+    # 寫入 submission.py
+    with open("submission.py", "w") as f:
+        f.write(submission_code)
+    
+    print(f"✅ 已生成 submission.py (架構: {'高級' if has_trunk else '簡單'})")
+    print(f"🔧 權重文件: {out_npz}")
+    print(f"📄 提交文件: submission.py")
+    
+    # 驗證生成的文件
+    try:
+        exec(compile(open("submission.py").read(), "submission.py", "exec"))
+        print("✅ submission.py 語法驗證通過")
+    except Exception as e:
+        print(f"⚠️ submission.py 語法驗證失敗: {e}")
+        
+    print("🎯 可以提交 submission.py 到 Kaggle 了！")
 
