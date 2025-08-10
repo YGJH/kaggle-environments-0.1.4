@@ -302,46 +302,67 @@ def self_play_opponent_strategy(board_flat, mark, valid_actions, agent):
     action, _, _ = agent.select_action(state, valid_actions, training=False)
     return int(action)
 
-# NEW: Worker function for collecting one episode in a separate process
-# It runs a lightweight copy of the PPOAgent on CPU to avoid GPU contention.
-def _worker_collect_episode(args):
+_WORKER = {
+    "agent": None,
+    "env": None,
+    "policy_version": -1,  # 尚未載入任何版本
+}
+
+def _worker_init_persistent(agent_cfg):
+    # 關 GPU、限執行緒，避免 CPU oversubscription
+    os.environ.setdefault('CUDA_VISIBLE_DEVICES', '')
+    os.environ.setdefault('OMP_NUM_THREADS', '1')
+    os.environ.setdefault('MKL_NUM_THREADS', '1')
     try:
-        # Force CPU in worker to avoid CUDA context sharing issues
-        os.environ.setdefault('CUDA_VISIBLE_DEVICES', '')
-        cfg = args['config']
-        # Rebuild torch tensors from numpy to avoid torch shared memory pickling
-        policy_state_np = args['policy_state']
-        policy_state = {k: (torch.from_numpy(v) if isinstance(v, np.ndarray) else v) for k, v in policy_state_np.items()}
-        player2_prob = args.get('player2_training_prob', 0.5)
+        torch.set_num_threads(1)
+    except Exception:
+        pass
+
+    # 初始化一次 Agent（CPU）與 Env
+    agent = PPOAgent(agent_cfg)            # 你的類別
+    agent.device = torch.device('cpu')
+    agent.policy_net.to(agent.device)
+    agent.policy_net.eval()
+
+    from kaggle_environments import make    # 放這裡避免主進程 import 影響
+    env = make('connectx', debug=False)
+
+    _WORKER["agent"] = agent
+    _WORKER["env"] = env
+    _WORKER["policy_version"] = -1
+
+def _worker_play_one(args):
+    """
+    單局對戰；持久化 agent/env，不重建。
+    僅在收到更高 policy_version 且夾帶權重時才 load_state_dict。
+    """
+    try:
+        agent = _WORKER["agent"]
+        env = _WORKER["env"]
+
+        # 權重更新（必要時）
+        pv = int(args.get("policy_version", -1))
+        weights_np = args.get("policy_state", None)  # 只有版本剛升時才會帶
+        if pv > _WORKER["policy_version"] and weights_np is not None:
+            state_dict = {k: torch.from_numpy(v.copy()) if isinstance(v, np.ndarray) else v
+                          for k, v in weights_np.items()}
+            agent.policy_net.load_state_dict(state_dict, strict=True)
+            agent.policy_net.eval()
+            _WORKER["policy_version"] = pv
+
+        # 每局的隨機性
         seed = args.get('seed', None)
         if seed is not None:
-            random.seed(seed)
-            np.random.seed(seed)
-            torch.manual_seed(seed)
-        
-        # Create a minimal agent on CPU and load weights
-        agent = PPOAgent(cfg['agent'])
-        agent.device = torch.device('cpu')
-        agent.policy_net.to(agent.device)
-        # state_dict tensors already on CPU
-        agent.policy_net.load_state_dict(policy_state)
-        agent.policy_net.eval()
+            random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
 
-        # === 開始遊戲 ===
-        env = make('connectx', debug=False)
+        # 開局
         env.reset()
-
-        # 隨機選擇對手類型: 'random', 'minimax', 'self'
-        opponent_types = ['random', 'minimax', 'self']
-        opponent_type = random.choice(opponent_types)
-        
-        # 隨機選擇訓練玩家  
-        p1_prob = 1.0 - float(player2_prob)
-        training_player = int(np.random.choice([1, 2], p=[p1_prob, player2_prob]))
+        opponent_type = random.choice(['random', 'minimax', 'self'])
+        player2_prob = float(args.get('player2_training_prob', 0.5))
+        training_player = int(np.random.choice([1, 2], p=[1.0 - player2_prob, player2_prob]))
 
         transitions = []
-        move_count = 0
-        max_moves = 50
+        move_count, max_moves = 0, 50
 
         with torch.no_grad():
             while not env.done and move_count < max_moves:
@@ -350,40 +371,28 @@ def _worker_collect_episode(args):
                     if env.state[player_idx]['status'] == 'ACTIVE':
                         board, current_player = agent.extract_board_and_mark(env.state, player_idx)
                         valid_actions = agent.get_valid_actions(board)
-                        
                         if current_player == training_player:
-                            # 訓練玩家使用策略網路
                             state = agent.encode_state(board, current_player)
                             action, prob, value = agent.select_action(state, valid_actions, training=True)
-                            
-                            # 記錄transition
                             transitions.append({
-                                'state': agent.encode_state(board, current_player),
+                                'state': state,
                                 'action': int(action),
                                 'prob': float(prob),
                                 'value': float(value),
                                 'training_player': training_player,
                                 'opponent_type': opponent_type,
-                                'is_dangerous': bool(if_i_will_lose_at_next(board, int(action), current_player, agent))
+                                'is_dangerous': bool(if_i_will_lose_at_next(board, int(action), current_player, agent)),
                             })
                         else:
-                            # 對手使用選定的策略
                             if opponent_type == 'random':
                                 action = random_opponent_strategy(board, current_player, valid_actions, agent)
                             elif opponent_type == 'minimax':
                                 action = minimax_opponent_strategy(board, current_player, valid_actions, agent, depth=3)
-                            elif opponent_type == 'self':
-                                action = self_play_opponent_strategy(board, current_player, valid_actions, agent)
                             else:
-                                action = random.choice(valid_actions)
-                            
-                            prob = 1.0 / max(1, len(valid_actions))
-                            value = 0.0
-                        
+                                action = self_play_opponent_strategy(board, current_player, valid_actions, agent)
                         actions.append(int(action))
                     else:
                         actions.append(0)
-                
                 try:
                     env.step(actions)
                 except Exception:
@@ -398,19 +407,20 @@ def _worker_collect_episode(args):
         return {
             'transitions': transitions,
             'training_player': training_player,
-            'player_result': player_result,
+            'player_result': int(player_result),
             'game_length': len(transitions),
-            'opponent_type': opponent_type
+            'opponent_type': opponent_type,
+            'policy_version_used': _WORKER["policy_version"],
         }
     except Exception as e:
-        # In workers, avoid heavy logging; return empty result on failure
         return {
             'transitions': [],
             'training_player': 1,
             'player_result': 0,
             'game_length': 0,
             'opponent_type': 'unknown',
-            'error': str(e)
+            'error': str(e),
+            'policy_version_used': _WORKER["policy_version"],
         }
 
 class DropPath(nn.Module):
@@ -1560,162 +1570,190 @@ class ConnectXTrainer:
             logger.error(f"載入檢查點時出錯: {e}")
             return False
 
+    # =========================
+    # [CHANGED] 主訓練流程
+    # =========================
+
     def train_parallel(self):
-        """平行蒐集 episode → 主行程更新 PPO → 週期評估/保存。"""
-        training_cfg = self.config.get('training', {})
-        num_workers = int(training_cfg.get('num_workers', max(1, (mp.cpu_count() or 2) - 1)))
-        episodes_per_update = int(training_cfg.get('episodes_per_update', 16))
-        max_episodes = int(training_cfg.get('max_episodes', 100000))
-        eval_frequency = int(training_cfg.get('eval_frequency', 200))
-        eval_games = int(training_cfg.get('eval_games', 30))
-        checkpoint_frequency = int(training_cfg.get('checkpoint_frequency', 1000))
-        use_tactical_opp = bool(training_cfg.get('use_tactical_opponent_in_rollout', False))
-        tactical_ratio = float(training_cfg.get('tactical_rollout_ratio', 0.0))
-        win_scale = float(training_cfg.get('win_reward_scaling', 1.0))
-        loss_scale = float(training_cfg.get('loss_penalty_scaling', 1.0))
+        cfg_t = self.config.get('training', {})
+        num_workers = int(cfg_t.get('num_workers', max(1, (mp.cpu_count() or 2) - 1)))
+        episodes_per_update = int(cfg_t.get('episodes_per_update', 16))  # 每次想處理多少局（僅做節奏控制）
+        max_episodes = int(cfg_t.get('max_episodes', 100000))
+        eval_frequency = int(cfg_t.get('eval_frequency', 200))
+        eval_games = int(cfg_t.get('eval_games', 30))
+        win_scale = float(cfg_t.get('win_reward_scaling', 1.0))
+        loss_scale = float(cfg_t.get('loss_penalty_scaling', 1.0))
         danger_scale = float(self.config.get('agent', {}).get('tactical_bonus', 0.1))
         min_batch_size = int(self.agent.config.get('min_batch_size', 512))
-        visualize_every = int(training_cfg.get('visualize_every', 100))
+        visualize_every = int(cfg_t.get('visualize_every', 100))
 
-        # Use spawn to reduce fd/shm issues; reuse a persistent pool
+        inflight_multiplier = int(cfg_t.get('inflight_multiplier', 2))  # 建議 1~3
+        target_inflight = max(1, num_workers * inflight_multiplier)
+
         try:
             mp_ctx = mp.get_context('spawn')
         except ValueError:
             mp_ctx = mp
-        pool = mp_ctx.Pool(processes=num_workers, maxtasksperchild=64)
+
+        pool = mp_ctx.Pool(
+            processes=num_workers,
+            initializer=_worker_init_persistent,
+            initargs=(self.config['agent'],)
+        )
 
         rng = random.Random()
         best_score = -1.0
-        # 盡量沿用已存在的 episode 計數（若從檢查點載入）
         episodes_done_total = len(self.episode_rewards)
-        print(f'visualize: {visualize_every}')
-        logger.info(f"🚀 啟動平行訓練：workers={num_workers}, episodes_per_update={episodes_per_update}")
 
-        def _collect_batch(policy_state_numpy, n_episodes: int):
-            args = []
-            for i in range(n_episodes):
-                use_tac = use_tactical_opp and (rng.random() < tactical_ratio)
-                args.append({
-                    'config': self.config,
-                    'policy_state': policy_state_numpy,
-                    'player2_training_prob': self.player2_training_prob,
-                    'use_tactical_opponent': use_tac,
-                    'seed': rng.randrange(2**31 - 1),
-                })
-            results = pool.map(_worker_collect_episode, args)
-            return results
+        # 版本控制
+        policy_version = 0
+        pending_weight_tasks = 0  # 本版本還需要送出幾個帶權重的任務（初始 0，由首次更新後觸發）
 
+        def _make_args(send_weights: bool):
+            weights_np = None
+            if send_weights:
+                # 僅當需要廣播新版本時才序列化一次
+                weights_np = {k: v.detach().cpu().numpy()
+                            for k, v in self.agent.policy_net.state_dict().items()}
+            return {
+                'policy_version': policy_version,
+                'policy_state': weights_np if send_weights else None,
+                'player2_training_prob': self.player2_training_prob,
+                'seed': rng.randrange(2**31 - 1),
+            }
+
+        # 建立初始 in-flight 任務
+        in_flight = []
+        # 第一次也需要把版本 0 的權重送給所有 worker
+        pending_weight_tasks = num_workers
+        for _ in range(target_inflight):
+            send_w = pending_weight_tasks > 0
+            if send_w:
+                pending_weight_tasks -= 1
+            ar = pool.apply_async(_worker_play_one, (_make_args(send_w),))
+            in_flight.append(ar)
+
+        logger.info(f"🚀 完全流水線訓練開始：workers={num_workers}, target_inflight={target_inflight}")
+
+        steps_since_update = 0
         try:
             while episodes_done_total < max_episodes:
-                # 將模型權重轉成 numpy，避免 torch 在多進程中使用共享記憶體/FD
-                policy_state_numpy = {k: v.detach().cpu().numpy() for k, v in self.agent.policy_net.state_dict().items()}
+                # 輕量輪詢完成的任務（避免 busy-wait）
+                i = 0
+                while i < len(in_flight):
+                    ar = in_flight[i]
+                    if ar.ready():
+                        # 取結果並處理
+                        res = ar.get()
+                        # 從 in_flight 移除（交換刪除避免 O(n)）
+                        in_flight[i] = in_flight[-1]
+                        in_flight.pop()
+                        # 立刻補上一個新任務（保持管線滿）
+                        send_w = pending_weight_tasks > 0
+                        if send_w:
+                            pending_weight_tasks -= 1
+                        in_flight.append(pool.apply_async(_worker_play_one, (_make_args(send_w),)))
 
-                results = _collect_batch(policy_state_numpy, episodes_per_update)
-                total_results = len(results)
-                collected_eps = 0
+                        # === consume result ===
+                        err_msg = res.get('error') if isinstance(res, dict) else None
+                        transitions = res.get('transitions', []) if isinstance(res, dict) else []
+                        if not transitions:
+                            self.episode_rewards.append(0.0)
+                            if err_msg:
+                                logger.debug(f"worker episode returned empty transitions: {err_msg}")
+                        else:
+                            player_result = int(res.get('player_result', 0))
+                            ep_reward_sum = 0.0
+                            last_idx = len(transitions) - 1
+                            for idx, tr in enumerate(transitions):
+                                state = tr['state']
+                                action = int(tr['action'])
+                                prob = float(tr['prob'])
+                                reward = 0.0
+                                if idx == last_idx:
+                                    reward += (1.0 * win_scale) if player_result == 1 else (
+                                            -1.0 * loss_scale if player_result == -1 else 0.0)
+                                if tr.get('is_dangerous', False):
+                                    reward += -10.0 * danger_scale
+                                ep_reward_sum += reward
+                                done = (idx == last_idx)
+                                self.agent.store_transition(state, action, prob, reward, done)
+                                steps_since_update += 1
+                            self.episode_rewards.append(ep_reward_sum)
 
-                for res in results:
-                    err_msg = res.get('error') if isinstance(res, dict) else None
-                    transitions = res.get('transitions', []) if isinstance(res, dict) else []
-                    if not transitions:
-                        # 即使該回合收集失敗，也算作一個 episode 以避免 Eps 一直為 0
-                        self.episode_rewards.append(0.0)
-                        collected_eps += 1
-                        if err_msg:
-                            logger.debug(f"worker episode returned empty transitions: {err_msg}")
+                            # 依你喜歡的節奏：步數達到就即刻更新
+                            if steps_since_update >= min_batch_size:
+                                info = self.agent.update_policy()
+                                if info is not None:
+                                    self.training_losses.append(info.get('total_loss', 0.0))
+                                    policy_version += 1
+                                    # 新版本出爐 → 至少廣播 num_workers 份帶權重任務
+                                    pending_weight_tasks += num_workers
+                                steps_since_update = 0
+
+                        episodes_done_total += 1
+
+                        # 週期性評估 / 視覺化（不要卡太久—保持快速）
+                        if eval_frequency > 0 and episodes_done_total % eval_frequency == 0:
+                            metrics = self.evaluate_comprehensive(games=eval_games)
+                            score = float(metrics.get('comprehensive_score', 0.0))
+                            self.win_rates.append(score)
+                            try:
+                                self.agent.scheduler.step(score)
+                            except Exception:
+                                pass
+                            logger.info(
+                                f"📈 Eps={episodes_done_total} | Score={score:.3f} | "
+                                f"self={metrics.get('self_play', 0):.3f} minimax={metrics.get('vs_minimax', 0):.3f} rand={metrics.get('vs_random', 0):.3f}"
+                            )
+                            try:
+                                if self._detect_convergence_stagnation(episodes_done_total, score):
+                                    self._handle_convergence_stagnation(episodes_done_total)
+                            except Exception:
+                                pass
+                            if score > best_score:
+                                best_score = score
+                                self.save_checkpoint(f"best_model_wr_{best_score:.3f}.pt")
+
+                        if visualize_every > 0 and episodes_done_total % visualize_every == 0:
+                            try:
+                                quick_games = max(5, int(eval_games // 2))
+                                metrics_v = self.evaluate_comprehensive(games=quick_games)
+                                score_v = float(metrics_v.get('comprehensive_score', 0.0))
+                                logger.info(
+                                    f"🎯 視覺化評估 Eps={episodes_done_total} | Score={score_v:.3f} | "
+                                    f"self={metrics_v.get('self_play', 0):.3f} minimax={metrics_v.get('vs_minimax', 0):.3f} rand={metrics_v.get('vs_random', 0):.3f}"
+                                )
+                            except Exception as ee:
+                                logger.warning(f"視覺化前評估失敗：{ee}")
+                            try:
+                                self.visualize_training_game(episodes_done_total, save_dir='videos', opponent='tactical', fps=2)
+                            except Exception as ve:
+                                logger.warning(f"可視覺化失敗：{ve}")
+
+                        # 不遞增 i，因為我們把末尾元素搬到 i 了；繼續檢查新的 in_flight[i]
                         continue
-                    player_result = int(res.get('player_result', 0))  # 1/0/-1
-                    ep_reward_sum = 0.0
-                    last_idx = len(transitions) - 1
-                    for idx, tr in enumerate(transitions):
-                        state = tr['state']
-                        action = int(tr['action'])
-                        prob = float(tr['prob'])
-                        reward = 0.0
-                        # 結束時給最終勝負回饋
-                        if idx == last_idx:
-                            if player_result == 1:
-                                reward += 1.0 * win_scale
-                            elif player_result == -1:
-                                reward += -1.0 * loss_scale
-                            else:
-                                reward += 0.0
-                        # 危險步懲罰（來自 worker 的快速戰術檢查）
-                        if tr.get('is_dangerous', False):
-                            reward += -10.0 * danger_scale
-                        ep_reward_sum += reward
-                        done = (idx == last_idx)
-                        self.agent.store_transition(state, action, prob, reward, done)
-                    self.episode_rewards.append(ep_reward_sum)
-                    collected_eps += 1
 
-                # 使用回傳結果數量來累積 episode，避免 0 回合的競態條件
-                episodes_done_total += total_results if total_results > 0 else collected_eps
+                    else:
+                        i += 1
 
-                # 當緩衝足夠大時才更新 PPO
-                if len(self.agent.memory) >= min_batch_size:
-                    info = self.agent.update_policy()
-                    if info is not None:
-                        self.training_losses.append(info.get('total_loss', 0.0))
+                # 若 in_flight 因故少於目標，補足（理論上不會發生，但保險）
+                while len(in_flight) < target_inflight:
+                    send_w = pending_weight_tasks > 0
+                    if send_w:
+                        pending_weight_tasks -= 1
+                    in_flight.append(pool.apply_async(_worker_play_one, (_make_args(send_w),)))
+                import time
+                # 小睡一下，降低 busy-wait（不影響吞吐）
+                time.sleep(0.002)
 
-                # 週期性評估（避免在 Eps=0 觸發）
-                if eval_frequency > 0 and episodes_done_total > 0 and episodes_done_total % eval_frequency == 0:
-                    metrics = self.evaluate_comprehensive(games=eval_games)
-                    score = float(metrics.get('comprehensive_score', 0.0))
-                    self.win_rates.append(score)
-                    # 調度學習率（以評估分數為目標）
-                    try:
-                        self.agent.scheduler.step(score)
-                    except Exception:
-                        pass
-                    logger.info(
-                        f"📈 Eps={episodes_done_total} | Score={score:.3f} | "
-                        f"self={metrics.get('self_play', 0):.3f} minimax={metrics.get('vs_minimax', 0):.3f} rand={metrics.get('vs_random', 0):.3f}"
-                    )
-                    # 偵測停滯
-                    try:
-                        if self._detect_convergence_stagnation(episodes_done_total, score):
-                            self._handle_convergence_stagnation(episodes_done_total)
-                    except Exception:
-                        pass
-                    # 更新最佳模型
-                    if score > best_score:
-                        best_score = score
-                        self.save_checkpoint(f"best_model_wr_{best_score:.3f}.pt")
-
-                # 週期性檢查點（避免在 Eps=0 觸發）
-                # if checkpoint_frequency > 0 and episodes_done_total > 0 and episodes_done_total % checkpoint_frequency == 0:
-                #     self.save_checkpoint(f"checkpoint_episode_{episodes_done_total}.pt")
-
-                # 週期性可視化（避免在 Eps=0 觸發）
-                if (
-                    visualize_every > 0 and
-                    episodes_done_total > 0 and
-                    episodes_done_total % visualize_every == 0
-                ):
-                    # 視覺化前先快速評估當前模型表現（減少遊戲數以節省時間）
-                    try:
-                        quick_games = max(5, int(eval_games // 2))
-                        metrics_v = self.evaluate_comprehensive(games=quick_games)
-                        score_v = float(metrics_v.get('comprehensive_score', 0.0))
-                        logger.info(
-                            f"🎯 視覺化評估 Eps={episodes_done_total} | Score={score_v:.3f} | "
-                            f"self={metrics_v.get('self_play', 0):.3f} minimax={metrics_v.get('vs_minimax', 0):.3f} rand={metrics_v.get('vs_random', 0):.3f}"
-                        )
-                    except Exception as ee:
-                        logger.warning(f"視覺化前評估失敗：{ee}")
-                    try:
-                        self.visualize_training_game(episodes_done_total, save_dir='videos', opponent='tactical', fps=2)
-                    except Exception as ve:
-                        logger.warning(f"可視化失敗：{ve}")
         finally:
             try:
-                pool.close()
-                pool.join()
+                pool.close(); pool.join()
             except Exception:
                 pass
 
-        logger.info("✅ 平行訓練完成")
+        logger.info("✅ 完全流水線訓練完成")
         return self.agent
 
     def _record_game_frames(self, opponent: str = 'tactical', max_moves: int = 50):
