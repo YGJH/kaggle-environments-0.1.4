@@ -12,8 +12,8 @@ import sys
 import numpy as np
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QGridLayout, QPushButton, QLabel, 
-                            QMessageBox, QFrame, QRadioButton, QButtonGroup)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+                            QMessageBox, QFrame, QRadioButton, QButtonGroup, QGraphicsOpacityEffect, QGraphicsColorizeEffect)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QEasingCurve, QPropertyAnimation
 from PyQt5.QtGui import QFont, QPalette, QColor
 from kaggle_environments import make, utils
 import time
@@ -80,31 +80,37 @@ class ConnectXGUI(QMainWindow):
         self.game_over = False
         self.ai_thinking = False
         self.ai_thread = None
-        # 先手選擇：預設人類先手
         self.ai_starts = False
-        # 動畫狀態
+        # 動畫 / 視覺狀態
         self.animating = False
         self.animation_timer = None
-        self.animation_interval_ms = 60  # 每格下落時間
-        
+        self.animation_interval_ms = 55
+        self.last_move = None
+        self.winning_cells = []
+        self.win_flash_timer = None
+        self.win_flash_state = False
+        # 新增：勝利線動畫
+        self.winning_line_timer = None
+        self.winning_line_anim_step = 0
+        self.winning_effects = []  # (cell,effect)
+        # 狀態標籤 pulse 動畫
+        self.status_pulse_anim = None
         self.init_ui()
+        self._init_status_pulse()
         
     def init_ui(self):
-        """初始化用戶界面"""
+        """初始化用戶界面 (modernized)"""
         self.setWindowTitle("ConnectX - 人類 vs AI")
-        self.setFixedSize(800, 740)
+        self.setFixedSize(860, 770)
+        # 應用全域樣式 (玻璃 & 漸層)
         self.setStyleSheet("""
-            QMainWindow {
-                background-color: #2c3e50;
-            }
-            QLabel {
-                color: white;
-            }
-            QPushButton {
-                font-weight: bold;
-                border-radius: 5px;
-                padding: 5px;
-            }
+            QMainWindow {background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #1f2d3a, stop:1 #10171e);} 
+            QLabel {color: #ecf0f1;}
+            QPushButton {font-weight:600; border-radius:8px; padding:6px 10px; background-color:#34495e; color:#ecf0f1; border:1px solid #2c3e50;}
+            QPushButton:hover {background-color:#3d5d74;}
+            QPushButton:pressed {background-color:#22313f;}
+            QPushButton:disabled {background-color:#4b5b66; color:#bdc3c7;}
+            QRadioButton {color:#ecf0f1;}
         """)
         
         # 中央Widget
@@ -306,37 +312,104 @@ class ConnectXGUI(QMainWindow):
         msg.setStandardButtons(QMessageBox.Ok)
         msg.exec_()
         
+    def _init_status_pulse(self):
+        if not hasattr(self, 'status_label'):
+            return
+        effect = QGraphicsOpacityEffect(self.status_label)
+        self.status_label.setGraphicsEffect(effect)
+        self.status_pulse_anim = QPropertyAnimation(effect, b"opacity", self)
+        self.status_pulse_anim.setDuration(1800)
+        self.status_pulse_anim.setStartValue(0.35)
+        self.status_pulse_anim.setEndValue(1.0)
+        self.status_pulse_anim.setLoopCount(-1)
+        self.status_pulse_anim.setEasingCurve(QEasingCurve.InOutQuad)
+        self.status_pulse_anim.start()
+
     def update_board_display(self):
-        """更新棋盤顯示"""
-        for row in range(self.rows):
-            for col in range(self.cols):
-                if self.board[row][col] == 0:
-                    self.cells[row][col].setText("⚪")
-                    self.cells[row][col].setStyleSheet("""
-                        QLabel {
-                            background-color: #ecf0f1;
-                            border: 2px solid #bdc3c7;
-                            border-radius: 5px;
-                        }
-                    """)
-                elif self.board[row][col] == 1:
-                    self.cells[row][col].setText("🔴")
-                    self.cells[row][col].setStyleSheet("""
-                        QLabel {
-                            background-color: #ffe6e6;
-                            border: 2px solid #ff9999;
-                            border-radius: 5px;
-                        }
-                    """)
+        """更新棋盤顯示 (加入最後一步與勝利高亮)"""
+        base_empty = """QLabel {background-color:#ecf0f1; border:2px solid #bdc3c7; border-radius:6px;}"""
+        style_p1 = """QLabel {background-color: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #ffb3b3, stop:1 #ff6f6f); border:2px solid #ff8f8f; border-radius:6px;}"""
+        style_p2 = """QLabel {background-color: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #ffe9b3, stop:1 #ffc94d); border:2px solid #ffcf66; border-radius:6px;}"""
+        style_last = "border:3px solid #ffffff; box-shadow:0 0 6px #fff;"
+        style_flash_a = "border:3px solid #2ecc71; box-shadow:0 0 10px #2ecc71;"
+        style_flash_b = "border:3px solid #27ae60; box-shadow:0 0 16px #27ae60;"
+        flashing = set(self.winning_cells)
+        for r in range(self.rows):
+            for c in range(self.cols):
+                cell = self.cells[r][c]
+                v = self.board[r][c]
+                if v == 0:
+                    cell.setText("⚪")
+                    cell.setStyleSheet(base_empty)
+                elif v == 1:
+                    cell.setText("🔴")
+                    cell.setStyleSheet(style_p1)
                 else:
-                    self.cells[row][col].setText("🟡")
-                    self.cells[row][col].setStyleSheet("""
-                        QLabel {
-                            background-color: #fff3cd;
-                            border: 2px solid #ffcc66;
-                            border-radius: 5px;
-                        }
-                    """)
+                    cell.setText("🟡")
+                    cell.setStyleSheet(style_p2)
+                if self.last_move == (r,c):
+                    # 疊加 last move 邊框
+                    cell.setStyleSheet(cell.styleSheet() + style_last)
+                if (r,c) in flashing:
+                    cell.setStyleSheet(cell.styleSheet() + (style_flash_a if self.win_flash_state else style_flash_b))
+    
+    def _toggle_win_flash(self):
+        self.win_flash_state = not self.win_flash_state
+        self.update_board_display()
+    
+    def _start_win_flash(self):
+        if self.win_flash_timer:
+            self.win_flash_timer.stop(); self.win_flash_timer.deleteLater()
+        self.win_flash_timer = QTimer(self)
+        self.win_flash_timer.timeout.connect(self._toggle_win_flash)
+        self.win_flash_timer.start(380)
+    
+    def _clear_winning_effects(self):
+        for cell, eff in self.winning_effects:
+            try:
+                cell.setGraphicsEffect(None)
+            except Exception:
+                pass
+        self.winning_effects.clear()
+        if self.winning_line_timer:
+            self.winning_line_timer.stop(); self.winning_line_timer.deleteLater(); self.winning_line_timer=None
+
+    def _start_winning_line_animation(self):
+        # 清掉舊的閃爍/特效
+        if self.win_flash_timer:
+            self.win_flash_timer.stop(); self.win_flash_timer.deleteLater(); self.win_flash_timer=None
+        self._clear_winning_effects()
+        if not self.winning_cells:
+            return
+        # 為每個勝利格套用 colorize effect
+        self.winning_effects = []
+        for (r,c) in self.winning_cells:
+            cell = self.cells[r][c]
+            eff = QGraphicsColorizeEffect(cell)
+            eff.setColor(QColor("#2ecc71"))
+            eff.setStrength(0.0)
+            cell.setGraphicsEffect(eff)
+            self.winning_effects.append((cell, eff))
+        self.winning_line_anim_step = 0
+        self.winning_line_timer = QTimer(self)
+        self.winning_line_timer.timeout.connect(self._advance_winning_line_animation)
+        self.winning_line_timer.start(80)
+
+    def _advance_winning_line_animation(self):
+        # 形成一個波動，依索引位移
+        import math
+        self.winning_line_anim_step += 1
+        base_phase = self.winning_line_anim_step * 0.18
+        n = len(self.winning_effects)
+        for idx, (cell, eff) in enumerate(self.winning_effects):
+            phase = base_phase - idx * 0.65
+            strength = 0.55 + 0.45 * math.sin(phase)
+            try:
+                eff.setStrength(max(0.0, min(1.0, strength)))
+            except Exception:
+                pass
+        # 同步更新邊框樣式（保留 last_move 判斷）
+        self.update_board_display()
     
     def is_valid_move(self, col):
         """檢查移動是否有效"""
@@ -353,37 +426,42 @@ class ConnectXGUI(QMainWindow):
                 return True
         return False
     
-    def check_win(self, player):
-        """檢查是否有玩家獲勝"""
-        # 檢查水平方向
-        for row in range(self.rows):
-            for col in range(self.cols - 3):
-                if all(self.board[row][col + i] == player for i in range(4)):
-                    return True
-        
-        # 檢查垂直方向  
-        for row in range(self.rows - 3):
-            for col in range(self.cols):
-                if all(self.board[row + i][col] == player for i in range(4)):
-                    return True
-        
-        # 檢查對角線（左上到右下）
-        for row in range(self.rows - 3):
-            for col in range(self.cols - 3):
-                if all(self.board[row + i][col + i] == player for i in range(4)):
-                    return True
-        
-        # 檢查對角線（右上到左下）
-        for row in range(self.rows - 3):
-            for col in range(3, self.cols):
-                if all(self.board[row + i][col - i] == player for i in range(4)):
-                    return True
-        
-        return False
-    
     def is_board_full(self):
         """檢查棋盤是否已滿"""
-        return all(self.board[0][col] != 0 for col in range(self.cols))
+        return all(self.board[0][c] != 0 for c in range(self.cols))
+    
+    def _compute_winning_cells(self, player):
+        lines = []
+        # horizontal
+        for r in range(self.rows):
+            for c in range(self.cols-3):
+                if all(self.board[r][c+i]==player for i in range(4)):
+                    lines.append([(r,c+i) for i in range(4)])
+        # vertical
+        for r in range(self.rows-3):
+            for c in range(self.cols):
+                if all(self.board[r+i][c]==player for i in range(4)):
+                    lines.append([(r+i,c) for i in range(4)])
+        # diag ↘
+        for r in range(self.rows-3):
+            for c in range(self.cols-3):
+                if all(self.board[r+i][c+i]==player for i in range(4)):
+                    lines.append([(r+i,c+i) for i in range(4)])
+        # diag ↙
+        for r in range(self.rows-3):
+            for c in range(3,self.cols):
+                if all(self.board[r+i][c-i]==player for i in range(4)):
+                    lines.append([(r+i,c-i) for i in range(4)])
+        return lines[0] if lines else []
+
+    def check_win(self, player):
+        # 重寫：同時儲存勝利位置並啟動新動畫
+        cells = self._compute_winning_cells(player)
+        if cells:
+            self.winning_cells = cells
+            self._start_winning_line_animation()
+            return True
+        return False
     
     def human_move(self, col):
         """處理人類玩家移動（加入動畫）"""
@@ -452,62 +530,45 @@ class ConnectXGUI(QMainWindow):
         """以動畫方式將棋子由頂部落到 target_row。
         finished_cb: 動畫完成後呼叫 (會在最後真正寫入 board 並刷新 / 呼叫後續邏輯)
         """
+        # 改良：模擬重力加速 (使用動態間隔)
         if self.animating:
             return
         self.animating = True
-        # 禁用互動
         self.disable_buttons()
         token = "🔴" if player == 1 else "🟡"
-        empty_style = """
-            QLabel {background-color: #ecf0f1; border: 2px solid #bdc3c7; border-radius:5px;}
-        """
-        # 預先記錄經過的 cell 以便清空
         path_rows = list(range(0, target_row + 1))
         current_index = {"i": 0}
-
+        base_interval = self.animation_interval_ms
         def step():
             i = current_index["i"]
-            # 清除上一格（非最上第一格）
             if i > 0:
-                prev_row = path_rows[i - 1]
-                # 若該格在 board 中還是空的才重畫成空（避免覆寫既有棋子）
-                if self.board[prev_row][col] == 0:
-                    self.cells[prev_row][col].setText("⚪")
-                    self.cells[prev_row][col].setStyleSheet(empty_style)
-            # 在目前格顯示 token（僅暫時顯示，不修改 board）
-            row_show = path_rows[i]
-            self.cells[row_show][col].setText(token)
-            # 簡單著色
-            if player == 1:
-                self.cells[row_show][col].setStyleSheet("""
-                    QLabel {background-color: #ffe6e6; border:2px solid #ff9999; border-radius:5px;}
-                """)
-            else:
-                self.cells[row_show][col].setStyleSheet("""
-                    QLabel {background-color: #fff3cd; border:2px solid #ffcc66; border-radius:5px;}
-                """)
+                pr = path_rows[i-1]
+                if self.board[pr][col] == 0:
+                    self.cells[pr][col].setText("⚪")
+            cr = path_rows[i]
+            self.cells[cr][col].setText(token)
             current_index["i"] += 1
             if current_index["i"] >= len(path_rows):
-                # 動畫完成 -> 實際落子
                 if self.board[target_row][col] == 0:
                     self.board[target_row][col] = player
-                # 刷新整盤保證樣式統一
+                self.last_move = (target_row, col)
                 self.update_board_display()
                 self.animating = False
-                if self.animation_timer is not None:
-                    self.animation_timer.stop()
-                    self.animation_timer.deleteLater()
-                    self.animation_timer = None
-                # 呼叫回調
-                if finished_cb:
-                    finished_cb()
+                if self.animation_timer:
+                    self.animation_timer.stop(); self.animation_timer.deleteLater(); self.animation_timer=None
+                try:
+                    if finished_cb:
+                        finished_cb()
+                except Exception as e:
+                    print(f"Finished callback error: {e}")
                 return
-
-        # 建立 QTimer 逐步執行
+            # 動態調整速度 (後段加速)
+            if self.animation_timer:
+                speed_factor = 0.55 + 0.45 * (current_index["i"] / len(path_rows))
+                self.animation_timer.setInterval(int(base_interval * (1.0 / speed_factor)))
         self.animation_timer = QTimer(self)
         self.animation_timer.timeout.connect(step)
-        self.animation_timer.start(self.animation_interval_ms)
-        # 立即執行第一步
+        self.animation_timer.start(base_interval)
         step()
     
     def ai_turn(self):
@@ -604,6 +665,11 @@ class ConnectXGUI(QMainWindow):
         self.game_over = False
         self.ai_thinking = False
         self.animating = False
+        self.winning_cells = []
+        if self.win_flash_timer:
+            self.win_flash_timer.stop(); self.win_flash_timer.deleteLater(); self.win_flash_timer=None
+        self.last_move = None
+        self._clear_winning_effects()
         self.update_board_display()
         
         # 根據先手選擇設定當前玩家與狀態
