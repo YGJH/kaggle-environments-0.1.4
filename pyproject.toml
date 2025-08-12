@@ -29,4 +29,5 @@ dependencies = [
     "pyqt5>=5.15.11",
     "psutil>=7.0.0",
     "opencv-python>=4.11.0.86",
+    "ray[default]>=2.48.0",
 ]

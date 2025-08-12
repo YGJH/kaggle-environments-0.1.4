@@ -212,11 +212,25 @@ _is_attn = {}
 for idx in _trunk_indices:
     _is_attn[idx] = 'trunk.' + str(idx) + '.qkv.weight' in weights
 
-# Infer channels / hidden
+# Infer channels / hidden / heads
 stem_w = weights['stem.0.weight']
 C = stem_w.shape[0]
 hidden = weights['head.1.weight'].shape[0]
 half_hidden = hidden//2
+
+# Dynamically infer attention heads from the first attention block
+attention_heads = 24  # Default to our new configuration
+if any(_is_attn.values()):
+    # Find first attention block to infer heads
+    first_attn_idx = min([idx for idx in _trunk_indices if _is_attn[idx]])
+    qkv_key = 'trunk.' + str(first_attn_idx) + '.qkv.weight'
+    if qkv_key in weights:
+        qkv_weight = weights[qkv_key]
+        # qkv produces 3*C channels, so each of q,k,v has C channels
+        # If C is divisible by common head counts, use the largest reasonable one
+        possible_heads = [h for h in [24, 12, 8, 6, 4, 3, 2, 1] if C % h == 0]
+        if possible_heads:
+            attention_heads = possible_heads[0]  # Use the largest possible
 
 # Precompute coord planes (-1..1)
 _row = np.tile(np.linspace(-1,1,6).reshape(6,1), (1,7))
@@ -240,8 +254,8 @@ def forward_pass(state):
             qkv = conv1x1(x, weights[qkv_key], None)
             Bq = qkv.shape[0]//3
             q, k, v = np.split(qkv, 3, axis=0)
-            # heads fixed to 4
-            heads = 4
+            # Use dynamically inferred heads
+            heads = attention_heads
             dim = q.shape[0]//heads
             HW = q.shape[1]*q.shape[2]
             def reshape_heads(t):

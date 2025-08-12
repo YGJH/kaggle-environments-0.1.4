@@ -17,6 +17,7 @@ from datetime import datetime
 import argparse
 import traceback
 import multiprocessing as mp  # NEW: multiprocessing for parallel rollouts
+import ray, numpy as np, torch, time, random
 
 try:
     import yaml
@@ -295,6 +296,82 @@ def minimax_opponent_strategy(board_flat, mark, valid_actions, agent, depth=3):
         if score > best_score:
             best_score, best_move = score, a
     return best_move
+# ===== 漸進式對手策略 (從弱到強) =====
+
+def pure_random_opponent_strategy(board_flat, mark, valid_actions, agent):
+    """純隨機對手，不使用任何戰術"""
+    return random.choice(valid_actions)
+
+def basic_win_only_opponent_strategy(board_flat, mark, valid_actions, agent):
+    """只會贏棋的基礎對手，不會防守"""
+    # 只檢查能否獲勝
+    c = if_i_can_win(board_flat, mark, agent)
+    if c is not None:
+        return c
+    # 其他情況純隨機
+    return random.choice(valid_actions)
+
+def defensive_only_opponent_strategy(board_flat, mark, valid_actions, agent):
+    """只會防守的對手，不會主動獲勝"""
+    # 只檢查是否需要阻止對手獲勝
+    c = if_i_will_lose(board_flat, mark, agent)
+    if c is not None:
+        return c
+    # 其他情況純隨機
+    return random.choice(valid_actions)
+
+def center_bias_opponent_strategy(board_flat, mark, valid_actions, agent):
+    """偏好中央列的弱對手"""
+    # 基本戰術：贏和防守
+    c = if_i_can_win(board_flat, mark, agent)
+    if c is not None:
+        return c
+    c = if_i_will_lose(board_flat, mark, agent)
+    if c is not None:
+        return c
+    
+    # 偏好中央列 (3, 4, 2, 5, 1, 6, 0)
+    center_preference = [3, 4, 2, 5, 1, 6, 0]
+    for col in center_preference:
+        if col in valid_actions:
+            return col
+    return random.choice(valid_actions)
+
+def weak_tactical_opponent_strategy(board_flat, mark, valid_actions, agent):
+    """弱化的戰術對手，有50%機率忽略戰術"""
+    # 50%機率使用戰術
+    if random.random() < 0.5:
+        c = if_i_can_win(board_flat, mark, agent)
+        if c is not None:
+            return c
+        c = if_i_will_lose(board_flat, mark, agent)
+        if c is not None:
+            return c
+    
+    # 其他情況隨機選擇
+    return random.choice(valid_actions)
+
+def mistake_prone_opponent_strategy(board_flat, mark, valid_actions, agent):
+    """容易犯錯的對手，會做出危險移動"""
+    # 基本戰術
+    c = if_i_can_win(board_flat, mark, agent)
+    if c is not None:
+        return c
+    c = if_i_will_lose(board_flat, mark, agent)
+    if c is not None:
+        return c
+    
+    # 30%機率故意選擇危險移動
+    if random.random() < 0.3:
+        dangerous_moves = []
+        for action in valid_actions:
+            if if_i_will_lose_at_next(board_flat, action, mark, agent):
+                dangerous_moves.append(action)
+        if dangerous_moves:
+            return random.choice(dangerous_moves)
+    
+    # 其他情況隨機
+    return random.choice(valid_actions)
 
 def self_play_opponent_strategy(board_flat, mark, valid_actions, agent):
     """Self-play opponent using current policy network."""
@@ -357,7 +434,27 @@ def _worker_play_one(args):
 
         # 開局
         env.reset()
-        opponent_type = random.choice(['random', 'minimax', 'self'])
+        
+        # 獲取當前訓練進度來選擇對手難度
+        current_win_rate = args.get('current_win_rate', 0.0)
+        
+        # 根據勝率選擇對手策略
+        if current_win_rate < 0.2:
+            # 初期：純隨機和只會贏的對手
+            opponent_type = random.choice(['pure_random', 'win_only'])
+        elif current_win_rate < 0.4:
+            # 進階：加入只會防守的對手
+            opponent_type = random.choice(['pure_random', 'win_only', 'defensive_only'])
+        elif current_win_rate < 0.55:
+            # 中期：加入偏好中央和弱戰術對手
+            opponent_type = random.choice(['win_only', 'defensive_only', 'center_bias', 'weak_tactical'])
+        elif current_win_rate < 0.7:
+            # 後期：加入容易犯錯的對手
+            opponent_type = random.choice(['center_bias', 'weak_tactical', 'mistake_prone'])
+        else:
+            # 高階：使用完整戰術對手
+            opponent_type = random.choice(['random', 'minimax', 'self'])
+        
         player2_prob = float(args.get('player2_training_prob', 0.5))
         training_player = int(np.random.choice([1, 2], p=[1.0 - player2_prob, player2_prob]))
 
@@ -384,11 +481,24 @@ def _worker_play_one(args):
                                 'is_dangerous': bool(if_i_will_lose_at_next(board, int(action), current_player, agent)),
                             })
                         else:
-                            if opponent_type == 'random':
+                            # 根據選定的對手類型選擇策略
+                            if opponent_type == 'pure_random':
+                                action = pure_random_opponent_strategy(board, current_player, valid_actions, agent)
+                            elif opponent_type == 'win_only':
+                                action = basic_win_only_opponent_strategy(board, current_player, valid_actions, agent)
+                            elif opponent_type == 'defensive_only':
+                                action = defensive_only_opponent_strategy(board, current_player, valid_actions, agent)
+                            elif opponent_type == 'center_bias':
+                                action = center_bias_opponent_strategy(board, current_player, valid_actions, agent)
+                            elif opponent_type == 'weak_tactical':
+                                action = weak_tactical_opponent_strategy(board, current_player, valid_actions, agent)
+                            elif opponent_type == 'mistake_prone':
+                                action = mistake_prone_opponent_strategy(board, current_player, valid_actions, agent)
+                            elif opponent_type == 'random':
                                 action = random_opponent_strategy(board, current_player, valid_actions, agent)
                             elif opponent_type == 'minimax':
                                 action = minimax_opponent_strategy(board, current_player, valid_actions, agent, depth=3)
-                            else:
+                            else:  # self
                                 action = self_play_opponent_strategy(board, current_player, valid_actions, agent)
                         actions.append(int(action))
                     else:
@@ -422,6 +532,7 @@ def _worker_play_one(args):
             'error': str(e),
             'policy_version_used': _WORKER["policy_version"],
         }
+
 
 class DropPath(nn.Module):
     """Stochastic Depth per sample (when training only)."""
@@ -463,9 +574,12 @@ class ConnectXNet(nn.Module):
                 pass
             blocks = max_blocks
         self.blocks = blocks
-        self.channels = 128
+        # 調整channels以配合attention heads (24的倍數)
+        # 24的最近倍數: 120, 144, 168, 192
+        self.channels = 144  # 144 = 24 * 6，確保heads能整除
         self.drop_path_rate = float(max(0.0, drop_path_rate))
-        self.attn_every = max(0, int(attn_every))
+        # 由於增加了attention heads，可以更頻繁地使用attention
+        self.attn_every = max(1, min(int(attn_every), 3))  # 限制在1-3之間，更頻繁的attention
 
         # Coordinate embedding (2,6,7)
         row = torch.linspace(-1, 1, steps=6).unsqueeze(1).repeat(1, 7)
@@ -513,19 +627,28 @@ class ConnectXNet(nn.Module):
                 return out
 
         class SpatialSelfAttention(nn.Module):
-            def __init__(self, c, heads=4):
+            def __init__(self, c, heads=24):
                 super().__init__()
+                # 確保heads能整除c，如果不能就調整到最接近的因數
+                if c % heads != 0:
+                    # 找到最接近的因數
+                    possible_heads = [i for i in range(1, c + 1) if c % i == 0]
+                    heads = min(possible_heads, key=lambda x: abs(x - heads))
+                    print(f"調整attention heads: {heads} (channels={c})")
+                
                 self.heads = heads
-                self.scale = (c // heads) ** -0.5
+                self.head_dim = c // heads
+                self.scale = self.head_dim ** -0.5
                 self.qkv = nn.Conv2d(c, c * 3, 1, bias=False)
                 self.proj = nn.Conv2d(c, c, 1, bias=False)
+                
             def forward(self, x):  # x: (B,C,H,W)
                 B, C, H, W = x.shape
-                qkv = self.qkv(x).reshape(B, 3, self.heads, C // self.heads, H * W)
-                q, k, v = qkv[:,0], qkv[:,1], qkv[:,2]  # (B,heads,dim,HW)
+                qkv = self.qkv(x).reshape(B, 3, self.heads, self.head_dim, H * W)
+                q, k, v = qkv[:,0], qkv[:,1], qkv[:,2]  # (B,heads,head_dim,HW)
                 attn = (q.transpose(-2,-1) @ k) * self.scale  # (B,heads,HW,HW)
                 attn = torch.softmax(attn, dim=-1)
-                out = (attn @ v.transpose(-2,-1)).transpose(-2,-1)  # (B,heads,dim,HW)
+                out = (attn @ v.transpose(-2,-1)).transpose(-2,-1)  # (B,heads,head_dim,HW)
                 out = out.reshape(B, C, H, W)
                 return self.proj(out)
 
@@ -797,9 +920,151 @@ class PPOAgent:
         except Exception:
             pass
         self.last_partial_reset_update = self.update_step
+   
+    def update_policy_from_batch(self, states, actions, old_action_probs, rewards, dones, is_weights):
+        """
+        使用給定的批次數據進行PPO更新，支持重要性加權（用於PER）
+        
+        Args:
+            states: list[tensor or np], 會在內部stack到device
+            actions: np[int64] shape [B]
+            old_action_probs: np[float32] shape [B]
+            rewards: np[float32] shape [B]
+            dones: np[bool] shape [B]
+            is_weights: torch.float32 shape [B]  # 重要性加權
 
-    def update_policy(self):
-        """使用 PPO 更新策略"""
+        Returns:
+            dict(total_loss=..., td_errors_abs=np.ndarray[B])
+        """
+        batch_size = len(states)
+        
+        # 1) 將states轉換為張量並移到device
+        try:
+            # 處理不同類型的states輸入
+            if isinstance(states[0], np.ndarray):
+                states_tensor = torch.FloatTensor(np.array(states)).to(self.device)
+            elif isinstance(states[0], torch.Tensor):
+                states_tensor = torch.stack(states).to(self.device)
+            else:
+                # 假設是list of float lists
+                states_tensor = torch.FloatTensor(states).to(self.device)
+        except Exception:
+            # 後備方案
+            states_tensor = torch.FloatTensor(np.array(states)).to(self.device)
+
+        # 2) 計算當前策略網路的值
+        with torch.no_grad():
+            _, values_tensor = self.policy_net(states_tensor)
+            values = values_tensor.cpu().numpy().flatten()
+
+        # 3) 計算優勢和回報使用GAE
+        advantages, returns = self.compute_gae(
+            rewards.tolist(), values.tolist(), dones.tolist(), 0,
+            self.gamma, self.config['gae_lambda']
+        )
+
+        # 4) 正規化優勢
+        advantages = np.array(advantages)
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # 5) 轉換為張量
+        actions_tensor = torch.LongTensor(actions).to(self.device)
+        old_probs_tensor = torch.FloatTensor(old_action_probs).to(self.device)
+        advantages_tensor = torch.FloatTensor(advantages).to(self.device)
+        returns_tensor = torch.FloatTensor(returns).to(self.device)
+
+        # 6) PPO更新多個epochs
+        total_loss = 0.0
+        entropy_sum = 0.0
+        policy_loss_sum = 0.0
+        value_loss_sum = 0.0
+        
+        for epoch in range(self.k_epochs):
+            # 前向傳播
+            new_probs, values = self.policy_net(states_tensor)
+
+            # 計算動作概率比率
+            new_action_probs = new_probs.gather(1, actions_tensor.unsqueeze(1)).squeeze()
+            ratio = new_action_probs / (old_probs_tensor + 1e-8)
+
+            # PPO clip損失
+            surr1 = ratio * advantages_tensor
+            surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * advantages_tensor
+            policy_loss = -torch.min(surr1, surr2)
+            
+            # 價值損失
+            value_loss = nn.MSELoss(reduction='none')(values.squeeze(), returns_tensor)
+
+            # 熵損失（鼓勵探索）
+            entropy = -(new_probs * torch.log(new_probs + 1e-8)).sum(dim=1)
+            
+            # 應用重要性加權（PER的修正）
+            weighted_policy_loss = (policy_loss * is_weights).mean()
+            weighted_value_loss = (value_loss * is_weights).mean()
+            weighted_entropy = (entropy * is_weights).mean()
+
+            # 總損失
+            loss = weighted_policy_loss + self.value_coef * weighted_value_loss - self.entropy_coef * weighted_entropy
+            
+            # 反向傳播
+            self.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 0.5)
+            self.optimizer.step()
+
+            # 累積統計
+            total_loss += loss.item()
+            policy_loss_sum += weighted_policy_loss.item()
+            value_loss_sum += weighted_value_loss.item()
+            entropy_sum += weighted_entropy.item()
+
+        # 7) 計算TD error絕對值作為新的priority
+        with torch.no_grad():
+            _, current_values = self.policy_net(states_tensor)
+            current_values = current_values.squeeze().cpu().numpy()
+            
+            # 計算TD error: |r + γV(s') - V(s)|
+            next_values = np.zeros_like(current_values)
+            for i in range(batch_size):
+                if not dones[i] and i < batch_size - 1:
+                    next_values[i] = current_values[i + 1] if i + 1 < len(current_values) else 0
+                else:
+                    next_values[i] = 0
+            
+            td_errors = rewards + self.gamma * next_values * (1 - dones.astype(float)) - current_values
+            td_errors_abs = np.abs(td_errors) + 1e-3
+
+        # 8) 更新熵檢測
+        self.update_step += 1
+        avg_entropy = entropy_sum / max(1, self.k_epochs)
+        self.entropy_window.append(avg_entropy)
+        
+        if len(self.entropy_window) >= max(5, self.entropy_window.maxlen or 5):
+            try:
+                mean_ent = float(np.mean(self.entropy_window))
+                if mean_ent < self.entropy_threshold and (self.update_step - self.last_partial_reset_update) >= self.reset_cooldown_updates:
+                    logger.info(f"🔁 低熵觸發部分重置: mean_entropy={mean_ent:.3f} < thr={self.entropy_threshold:.3f}")
+                    self.partial_reset('res_blocks_and_head')
+            except Exception as e:
+                try:
+                    logger.debug(f"entropy reset check failed: {e}")
+                except Exception:
+                    pass
+
+        return {
+            "total_loss": total_loss / self.k_epochs,
+            "policy_loss": policy_loss_sum / self.k_epochs,
+            "value_loss": value_loss_sum / self.k_epochs,
+            "entropy": avg_entropy,
+            "td_errors_abs": td_errors_abs
+        }
+
+    def update_policy(self, use_batch_method=False):
+        """使用 PPO 更新策略
+        
+        Args:
+            use_batch_method: 如果為True，使用update_policy_from_batch方法
+        """
         if len(self.memory) < self.config['min_batch_size']:
             return None
 
@@ -818,6 +1083,32 @@ class PPOAgent:
             rewards.append(reward)
             dones.append(done)
 
+        if use_batch_method:
+            # 使用新的批次更新方法
+            states_array = np.array(states)
+            actions_array = np.array(actions, dtype=np.int64)
+            old_probs_array = np.array(old_probs, dtype=np.float32)
+            rewards_array = np.array(rewards, dtype=np.float32)
+            dones_array = np.array(dones, dtype=bool)
+            
+            # 創建統一的重要性權重（傳統方法中都是1.0）
+            is_weights = torch.ones(len(states), dtype=torch.float32, device=self.device)
+            
+            # 調用新的批次更新方法
+            result = self.update_policy_from_batch(
+                states=states_array,
+                actions=actions_array,
+                old_action_probs=old_probs_array,
+                rewards=rewards_array,
+                dones=dones_array,
+                is_weights=is_weights
+            )
+            
+            # 清空記憶體
+            self.memory.clear()
+            return result
+        
+        # 原始的更新方法
         # 計算所有狀態的價值
         states_tensor = torch.FloatTensor(np.array(states)).to(self.device)
         with torch.no_grad():
@@ -898,6 +1189,199 @@ class PPOAgent:
             'entropy': avg_entropy,
             'total_loss': total_loss / self.k_epochs
         }
+
+
+
+
+
+
+
+@ray.remote(num_cpus=1)
+class RolloutActor:
+    def __init__(self, agent_cfg):
+        # 隔離 CUDA + 限制 BLAS 執行緒
+        os.environ.setdefault('CUDA_VISIBLE_DEVICES', '')
+        os.environ.setdefault('OMP_NUM_THREADS', '1')
+        os.environ.setdefault('MKL_NUM_THREADS', '1')
+        try:
+            torch.set_num_threads(1)
+        except Exception:
+            pass
+
+        # 初始化一次 Agent（CPU）與 Env
+        self.agent = PPOAgent(agent_cfg)
+        self.agent.device = torch.device('cpu')
+        self.agent.policy_net.to(self.agent.device)
+        self.agent.policy_net.eval()
+        from kaggle_environments import make
+        self.env = make('connectx', debug=False)
+        self.policy_version = -1
+
+    def set_weights(self, weights_np, version: int):
+        # 只有版本提升才載入
+        if version > self.policy_version and weights_np is not None:
+            state_dict = {k: torch.from_numpy(v.copy()) if isinstance(v, np.ndarray) else v
+                          for k, v in weights_np.items()}
+            self.agent.policy_net.load_state_dict(state_dict, strict=True)
+            self.agent.policy_net.eval()
+            self.policy_version = version
+        return self.policy_version
+
+    def rollout(self, n_episodes: int, player2_prob: float, seed: int = None):
+        if seed is not None:
+            random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+
+        all_transitions = []
+        meta = {"episodes": 0, "policy_version_used": self.policy_version, "wins":0,"losses":0,"draws":0}
+        max_moves = 50
+
+        with torch.no_grad():
+            for _ in range(n_episodes):
+                self.env.reset()
+                opponent_type = random.choice(['random', 'minimax', 'self'])
+                training_player = int(np.random.choice([1,2], p=[1.0 - player2_prob, player2_prob]))
+                ep_transitions = []
+                move_count = 0
+
+                while not self.env.done and move_count < max_moves:
+                    actions = []
+                    for player_idx in range(2):
+                        if self.env.state[player_idx]['status'] == 'ACTIVE':
+                            board, current_player = self.agent.extract_board_and_mark(self.env.state, player_idx)
+                            valid_actions = self.agent.get_valid_actions(board)
+                            if current_player == training_player:
+                                state = self.agent.encode_state(board, current_player)
+                                action, prob, value = self.agent.select_action(state, valid_actions, training=True)
+                                ep_transitions.append({
+                                    'state': state,
+                                    'action': int(action),
+                                    'prob': float(prob),
+                                    'value': float(value),
+                                    'is_dangerous': bool(if_i_will_lose_at_next(board, int(action), current_player, self.agent)),
+                                })
+                            else:
+                                if opponent_type == 'random':
+                                    action = random_opponent_strategy(board, current_player, valid_actions, self.agent)
+                                elif opponent_type == 'minimax':
+                                    action = minimax_opponent_strategy(board, current_player, valid_actions, self.agent, depth=3)
+                                else:
+                                    action = self_play_opponent_strategy(board, current_player, valid_actions, self.agent)
+                            actions.append(int(action))
+                        else:
+                            actions.append(0)
+                    try:
+                        self.env.step(actions)
+                    except Exception:
+                        break
+                    move_count += 1
+
+                # 回合結束：決定結果
+                try:
+                    r = self.env.state[0]['reward'] if training_player == 1 else self.env.state[1]['reward']
+                except Exception:
+                    r = 0
+                if r == 1: meta["wins"] += 1
+                elif r == -1: meta["losses"] += 1
+                else: meta["draws"] += 1
+
+                all_transitions.append((ep_transitions, int(r)))
+                meta["episodes"] += 1
+
+        return all_transitions, meta
+
+class PERBuffer:
+    def __init__(self, capacity=200_000, alpha=0.6, beta_start=0.4, beta_frames=200_000, danger_boost=2.0, eps=1e-3):
+        """
+        alpha: 決定優先度對抽樣機率的影響（0=均勻, 1=完全依賴優先度）
+        beta: 重要性加權修正，從 beta_start 緩升到 1.0
+        danger_boost: 危險步優先度乘子
+        """
+        self.capacity = capacity
+        self.alpha = float(alpha)
+        self.beta_start = float(beta_start)
+        self.beta_frames = int(beta_frames)
+        self.frame = 1
+        self.eps = float(eps)
+        self.danger_boost = float(danger_boost)
+
+        self.data = deque(maxlen=capacity)
+        self.priorities = deque(maxlen=capacity)
+        self.is_danger = deque(maxlen=capacity)
+        self.max_priority = 1.0
+
+    def __len__(self):
+        return len(self.data)
+
+    def beta_by_frame(self):
+        # 緩升到 1.0，避免一開始權重太重
+        t = min(1.0, self.frame / max(1, self.beta_frames))
+        return self.beta_start + t * (1.0 - self.beta_start)
+
+    def add(self, transition, td_error_abs=None, is_dangerous=False):
+        # 初始優先度：max_priority；若有 td_error_abs 用它
+        p = float(td_error_abs) if td_error_abs is not None else self.max_priority
+        if is_dangerous:
+            p *= self.danger_boost
+        self.data.append(transition)
+        self.priorities.append(p)
+        self.is_danger.append(bool(is_dangerous))
+        self.max_priority = max(self.max_priority, p)
+
+    def sample(self, batch_size, danger_fraction=0.25):
+        n = len(self.data)
+        if n == 0:
+            return [], [], []
+
+        # 機率分佈
+        prios = np.array(self.priorities, dtype=np.float64)
+        probs = prios ** self.alpha
+        probs_sum = probs.sum()
+        if probs_sum <= 0:
+            probs = np.ones_like(probs) / len(probs)
+        else:
+            probs /= probs_sum
+
+        # 危險子集
+        danger_mask = np.array(self.is_danger, dtype=bool)
+        k_danger = int(round(batch_size * danger_fraction))
+        k_rest = batch_size - k_danger
+
+        idxs = []
+        if k_danger > 0 and danger_mask.any():
+            probs_d = probs.copy()
+            probs_d[~danger_mask] = 0.0
+            s = probs_d.sum()
+            probs_d = probs_d / s if s > 0 else np.ones_like(probs_d) / probs_d.size
+            idxs_danger = np.random.choice(np.arange(n), size=min(k_danger, danger_mask.sum()), replace=False, p=probs_d)
+            idxs.extend(idxs_danger.tolist())
+
+        # 其餘從全體按機率抽（避免重覆）
+        if k_rest > 0:
+            probs_rest = probs.copy()
+            if idxs:
+                probs_rest[idxs] = 0.0
+                s = probs_rest.sum()
+                probs_rest = probs_rest / s if s > 0 else np.ones_like(probs_rest) / probs_rest.size
+            idxs_rest = np.random.choice(np.arange(n), size=min(k_rest, n - len(idxs)), replace=False, p=probs_rest)
+            idxs.extend(idxs_rest.tolist())
+
+        # 重要性加權（IS weights）
+        probs_used = probs[idxs]
+        beta = self.beta_by_frame()
+        weights = (n * probs_used) ** (-beta)
+        weights = weights / (weights.max() + 1e-8)
+        self.frame += 1
+
+        batch = [self.data[i] for i in idxs]
+        return batch, idxs, weights
+
+    def update_priorities(self, idxs, td_errors_abs, is_dangerous_flags=None):
+        for j, i in enumerate(idxs):
+            p = float(td_errors_abs[j]) + self.eps
+            if is_dangerous_flags is not None and is_dangerous_flags[j]:
+                p *= self.danger_boost
+            self.priorities[i] = p
+            self.max_priority = max(self.max_priority, p)
 
 class ConnectXTrainer:
     """ConnectX 訓練器"""
@@ -1288,6 +1772,192 @@ class ConnectXTrainer:
             elif r == 0:
                 draws += 1
         return wins / max(1, int(games))
+    def train_with_ray(self):
+        tcfg = self.config.get('training', {})
+        num_actors = int(tcfg.get('num_workers',  max(1, (os.cpu_count() or 2) - 1)))
+        episodes_per_task = int(tcfg.get('episodes_per_update', 8))  # 每個 actor 一次打幾局
+        max_episodes = int(tcfg.get('max_episodes', 100_000))
+        eval_frequency = int(tcfg.get('eval_frequency', 200))
+        eval_games = int(tcfg.get('eval_games', 30))
+        win_scale = float(tcfg.get('win_reward_scaling', 1.0))
+        loss_scale = float(tcfg.get('loss_penalty_scaling', 1.0))
+        danger_scale = float(self.config.get('agent', {}).get('tactical_bonus', 0.1))
+        visualize_every = int(tcfg.get('visualize_every', 100))
+
+        # PER 超參數
+        capacity = int(tcfg.get('replay_capacity', 300_000))
+        alpha = float(tcfg.get('per_alpha', 0.6))
+        beta_start = float(tcfg.get('per_beta_start', 0.4))
+        beta_frames = int(tcfg.get('per_beta_frames', 200_000))
+        danger_boost = float(tcfg.get('danger_priority_boost', 2.0))
+        danger_fraction = float(tcfg.get('danger_oversample_fraction', 0.25))
+        min_batch_size = int(self.agent.config.get('min_batch_size', 512))
+        sgd_batch_size = int(self.agent.config.get('sgd_batch_size', 256))
+
+        rng = random.Random()
+
+        # 啟動 Ray
+        if not ray.is_initialized():
+            ray.init(ignore_reinit_error=True, include_dashboard=False)
+
+        # 建 actors
+        actors = [RolloutActor.remote(self.config['agent']) for _ in range(num_actors)]
+
+        # 初始權重 -> 廣播
+        def export_weights_numpy():
+            return {k: v.detach().cpu().numpy() for k, v in self.agent.policy_net.state_dict().items()}
+
+        policy_version = 0
+        weights_np = export_weights_numpy()
+        ray.get([a.set_weights.remote(weights_np, policy_version) for a in actors])
+
+        # PER 緩衝
+        per = PERBuffer(capacity=capacity, alpha=alpha, beta_start=beta_start, beta_frames=beta_frames, danger_boost=danger_boost)
+
+        # 建立初始 in-flight 任務
+        in_flight = []
+        def submit(actor):
+            return actor.rollout.remote(n_episodes=episodes_per_task, player2_prob=self.player2_training_prob, seed=rng.randrange(2**31-1))
+        in_flight = [submit(a) for a in actors]
+
+        episodes_done_total = len(self.episode_rewards)
+        best_score = -1.0
+
+        logger.info(f"🚀 Ray Actor 平行訓練啟動：actors={num_actors}, episodes_per_task={episodes_per_task}")
+
+        try:
+            while episodes_done_total < max_episodes:
+                # 等待任一 actor 完成
+                done_ids, in_flight = ray.wait(in_flight, num_returns=1, timeout=1.0)
+                if not done_ids:
+                    continue
+
+                # 立刻補件
+                finished_id = done_ids[0]
+                # 找到是哪個 actor 完成（簡單做法：再派給全部，其中 Ray 會排給空閒的，不需要逐一對應）
+                in_flight.extend([submit(a) for a in actors if len(in_flight) < len(actors)])
+
+                # 取結果
+                all_transitions, meta = ray.get(finished_id)
+                # 逐回合寫入 PER
+                for ep_transitions, result in all_transitions:
+                    ep_reward_sum = 0.0
+                    last_idx = len(ep_transitions) - 1
+                    if last_idx < 0:
+                        self.episode_rewards.append(0.0)
+                        episodes_done_total += 1
+                        continue
+
+                    for idx, tr in enumerate(ep_transitions):
+                        reward = 0.0
+                        if idx == last_idx:
+                            if result == 1:
+                                reward += 1.0 * win_scale
+                            elif result == -1:
+                                reward += -1.0 * loss_scale
+                        if tr.get('is_dangerous', False):
+                            reward += -10.0 * danger_scale
+                        ep_reward_sum += reward
+
+                        transition = {
+                            'state': tr['state'],
+                            'action': tr['action'],
+                            'prob': tr['prob'],
+                            'reward': reward,
+                            'done': (idx == last_idx),
+                            'is_dangerous': tr.get('is_dangerous', False),
+                        }
+
+                        # 初始 priority：用 |reward| 當近似（等會兒更新後再覆蓋）
+                        init_prio = abs(reward) + 1e-3
+                        if transition['is_dangerous']:
+                            init_prio *= danger_boost
+                        per.add(transition, td_error_abs=init_prio, is_dangerous=transition['is_dangerous'])
+
+                    self.episode_rewards.append(ep_reward_sum)
+                    episodes_done_total += 1
+
+                # 只要資料夠，就多次 SGD 更新（讓 Actor 不停打局）
+                while len(per) >= min_batch_size:
+                    batch, idxs, is_weights = per.sample(sgd_batch_size, danger_fraction=danger_fraction)
+                    if not batch:
+                        break
+
+                    # 封裝給 agent（兩種選擇：1) 丟回 self.agent.memory 然後用你原有的 update；
+                    # 2) 直接寫一個 update_policy_from_batch）
+                    # 這裡示範 2)，用一個你可以在 agent 內實作的介面：
+                    states = [b['state'] for b in batch]
+                    actions = np.array([b['action'] for b in batch], dtype=np.int64)
+                    old_probs = np.array([b['prob'] for b in batch], dtype=np.float32)
+                    rewards = np.array([b['reward'] for b in batch], dtype=np.float32)
+                    dones = np.array([b['done'] for b in batch], dtype=bool)
+                    is_danger_flags = np.array([b['is_dangerous'] for b in batch], dtype=bool)
+                    isw = torch.as_tensor(is_weights, dtype=torch.float32, device=self.agent.device)
+
+                    # 你可以在 agent 內部把 states -> tensor、計算新 logprob / value、GAE、PPO loss 等
+                    # 並回傳每筆樣本的 |TD-error| 或 |Advantage| 當 priority 更新依據
+                    info = self.agent.update_policy_from_batch(
+                        states=states,
+                        actions=actions,
+                        old_action_probs=old_probs,
+                        rewards=rewards,
+                        dones=dones,
+                        is_weights=isw
+                    )
+                    # 期望 info 回來有 'td_errors_abs'（len==batch），沒有就用 |rewards| 代替
+                    if info is not None:
+                        self.training_losses.append(float(info.get('total_loss', 0.0)))
+
+                    td_err = info.get('td_errors_abs') if info is not None else np.abs(rewards) + 1e-3
+                    per.update_priorities(idxs, td_err, is_dangerous_flags=is_danger_flags)
+
+                    # 成功更新後→廣播新權重（只在有實質更新時）
+                    policy_version += 1
+                    weights_np = {k: v.detach().cpu().numpy() for k, v in self.agent.policy_net.state_dict().items()}
+                    # 只在版本升級點廣播一次（Ray 會並行 set_weights）
+                    ray.get([a.set_weights.remote(weights_np, policy_version) for a in actors])
+
+                # 週期性評估與視覺化
+                if eval_frequency > 0 and episodes_done_total > 0 and episodes_done_total % eval_frequency == 0:
+                    metrics = self.evaluate_comprehensive(games=eval_games)
+                    score = float(metrics.get('comprehensive_score', 0.0))
+                    self.win_rates.append(score)
+                    try:
+                        self.agent.scheduler.step(score)
+                    except Exception:
+                        pass
+                    logger.info(
+                        f"📈 Eps={episodes_done_total} | Score={score:.3f} | "
+                        f"self={metrics.get('self_play', 0):.3f} minimax={metrics.get('vs_minimax', 0):.3f} rand={metrics.get('vs_random', 0):.3f}"
+                    )
+                    if score > best_score:
+                        best_score = score
+                        self.save_checkpoint(f"best_model_wr_{best_score:.3f}.pt")
+
+                if visualize_every > 0 and episodes_done_total > 0 and episodes_done_total % visualize_every == 0:
+                    try:
+                        quick_games = max(5, int(eval_games // 2))
+                        metrics_v = self.evaluate_comprehensive(games=quick_games)
+                        score_v = float(metrics_v.get('comprehensive_score', 0.0))
+                        logger.info(
+                            f"🎯 視覺化評估 Eps={episodes_done_total} | Score={score_v:.3f} | "
+                            f"self={metrics_v.get('self_play', 0):.3f} minimax={metrics_v.get('vs_minimax', 0):.3f} rand={metrics_v.get('vs_random', 0):.3f}"
+                        )
+                    except Exception as ee:
+                        logger.warning(f"視覺化前評估失敗：{ee}")
+                    try:
+                        self.visualize_training_game(episodes_done_total, save_dir='videos', opponent='tactical', fps=2)
+                    except Exception as ve:
+                        logger.warning(f"可視覺化失敗：{ve}")
+
+        finally:
+            try:
+                ray.shutdown()
+            except Exception:
+                pass
+
+        logger.info("✅ Ray Actor 平行訓練完成")
+        return self.agent
 
     def evaluate_self_play_player2_focus(self, games: int = 50):
         """評估我方作為後手(玩家2)時的勝率，對手採戰術規則。"""
@@ -1577,7 +2247,7 @@ class ConnectXTrainer:
     def train_parallel(self):
         cfg_t = self.config.get('training', {})
         num_workers = int(cfg_t.get('num_workers', max(1, (mp.cpu_count() or 2) - 1)))
-        episodes_per_update = int(cfg_t.get('episodes_per_update', 16))  # 每次想處理多少局（僅做節奏控制）
+        episodes_per_update = int(cfg_t.get('episodes_per_update', 16))
         max_episodes = int(cfg_t.get('max_episodes', 100000))
         eval_frequency = int(cfg_t.get('eval_frequency', 200))
         eval_games = int(cfg_t.get('eval_games', 30))
@@ -1587,7 +2257,7 @@ class ConnectXTrainer:
         min_batch_size = int(self.agent.config.get('min_batch_size', 512))
         visualize_every = int(cfg_t.get('visualize_every', 100))
 
-        inflight_multiplier = int(cfg_t.get('inflight_multiplier', 2))  # 建議 1~3
+        inflight_multiplier = int(cfg_t.get('inflight_multiplier', 2))
         target_inflight = max(1, num_workers * inflight_multiplier)
 
         try:
@@ -1604,27 +2274,27 @@ class ConnectXTrainer:
         rng = random.Random()
         best_score = -1.0
         episodes_done_total = len(self.episode_rewards)
+        current_win_rate = 0.0  # 追蹤當前勝率
 
         # 版本控制
         policy_version = 0
-        pending_weight_tasks = 0  # 本版本還需要送出幾個帶權重的任務（初始 0，由首次更新後觸發）
+        pending_weight_tasks = 0
 
         def _make_args(send_weights: bool):
             weights_np = None
             if send_weights:
-                # 僅當需要廣播新版本時才序列化一次
                 weights_np = {k: v.detach().cpu().numpy()
                             for k, v in self.agent.policy_net.state_dict().items()}
             return {
                 'policy_version': policy_version,
                 'policy_state': weights_np if send_weights else None,
                 'player2_training_prob': self.player2_training_prob,
+                'current_win_rate': current_win_rate,  # 傳遞當前勝率
                 'seed': rng.randrange(2**31 - 1),
             }
 
         # 建立初始 in-flight 任務
         in_flight = []
-        # 第一次也需要把版本 0 的權重送給所有 worker
         pending_weight_tasks = num_workers
         for _ in range(target_inflight):
             send_w = pending_weight_tasks > 0
@@ -1633,22 +2303,24 @@ class ConnectXTrainer:
             ar = pool.apply_async(_worker_play_one, (_make_args(send_w),))
             in_flight.append(ar)
 
-        logger.info(f"🚀 完全流水線訓練開始：workers={num_workers}, target_inflight={target_inflight}")
+        logger.info(f"🚀 漸進式難度訓練開始：workers={num_workers}, target_inflight={target_inflight}")
 
         steps_since_update = 0
+        recent_results = []  # 追蹤最近的對戰結果
+        
         try:
             while episodes_done_total < max_episodes:
-                # 輕量輪詢完成的任務（避免 busy-wait）
+                # 輕量輪詢完成的任務
                 i = 0
                 while i < len(in_flight):
                     ar = in_flight[i]
                     if ar.ready():
                         # 取結果並處理
                         res = ar.get()
-                        # 從 in_flight 移除（交換刪除避免 O(n)）
+                        # 從 in_flight 移除
                         in_flight[i] = in_flight[-1]
                         in_flight.pop()
-                        # 立刻補上一個新任務（保持管線滿）
+                        # 立刻補上一個新任務
                         send_w = pending_weight_tasks > 0
                         if send_w:
                             pending_weight_tasks -= 1
@@ -1659,10 +2331,21 @@ class ConnectXTrainer:
                         transitions = res.get('transitions', []) if isinstance(res, dict) else []
                         if not transitions:
                             self.episode_rewards.append(0.0)
+                            recent_results.append(0)  # 記錄平局
                             if err_msg:
                                 logger.debug(f"worker episode returned empty transitions: {err_msg}")
                         else:
                             player_result = int(res.get('player_result', 0))
+                            recent_results.append(1 if player_result == 1 else 0)  # 記錄勝敗
+                            
+                            # 只保留最近1000局的結果來計算勝率
+                            if len(recent_results) > 1000:
+                                recent_results.pop(0)
+                            
+                            # 更新當前勝率
+                            if len(recent_results) >= 100:  # 至少100局後才開始計算
+                                current_win_rate = sum(recent_results) / len(recent_results)
+                            
                             ep_reward_sum = 0.0
                             last_idx = len(transitions) - 1
                             for idx, tr in enumerate(transitions):
@@ -1681,19 +2364,18 @@ class ConnectXTrainer:
                                 steps_since_update += 1
                             self.episode_rewards.append(ep_reward_sum)
 
-                            # 依你喜歡的節奏：步數達到就即刻更新
+                            # 更新策略
                             if steps_since_update >= min_batch_size:
                                 info = self.agent.update_policy()
                                 if info is not None:
                                     self.training_losses.append(info.get('total_loss', 0.0))
                                     policy_version += 1
-                                    # 新版本出爐 → 至少廣播 num_workers 份帶權重任務
                                     pending_weight_tasks += num_workers
                                 steps_since_update = 0
 
                         episodes_done_total += 1
 
-                        # 週期性評估 / 視覺化（不要卡太久—保持快速）
+                        # 週期性評估
                         if eval_frequency > 0 and episodes_done_total % eval_frequency == 0:
                             metrics = self.evaluate_comprehensive(games=eval_games)
                             score = float(metrics.get('comprehensive_score', 0.0))
@@ -1702,10 +2384,24 @@ class ConnectXTrainer:
                                 self.agent.scheduler.step(score)
                             except Exception:
                                 pass
+                            
+                            # 顯示當前對手難度等級
+                            if current_win_rate < 0.2:
+                                difficulty = "初級 (純隨機+只會贏)"
+                            elif current_win_rate < 0.4:
+                                difficulty = "初階 (加入防守)"
+                            elif current_win_rate < 0.55:
+                                difficulty = "中階 (偏好中央+弱戰術)"
+                            elif current_win_rate < 0.7:
+                                difficulty = "進階 (容易犯錯)"
+                            else:
+                                difficulty = "高階 (完整戰術)"
+                            
                             logger.info(
-                                f"📈 Eps={episodes_done_total} | Score={score:.3f} | "
-                                f"self={metrics.get('self_play', 0):.3f} minimax={metrics.get('vs_minimax', 0):.3f} rand={metrics.get('vs_random', 0):.3f}"
+                                f"📈 Eps={episodes_done_total} | Score={score:.3f} | 當前勝率={current_win_rate:.3f} | "
+                                f"對手難度={difficulty} | self={metrics.get('self_play', 0):.3f} minimax={metrics.get('vs_minimax', 0):.3f} rand={metrics.get('vs_random', 0):.3f}"
                             )
+                            
                             try:
                                 if self._detect_convergence_stagnation(episodes_done_total, score):
                                     self._handle_convergence_stagnation(episodes_done_total)
@@ -1731,20 +2427,19 @@ class ConnectXTrainer:
                             except Exception as ve:
                                 logger.warning(f"可視覺化失敗：{ve}")
 
-                        # 不遞增 i，因為我們把末尾元素搬到 i 了；繼續檢查新的 in_flight[i]
                         continue
 
                     else:
                         i += 1
 
-                # 若 in_flight 因故少於目標，補足（理論上不會發生，但保險）
+                # 補足 in_flight
                 while len(in_flight) < target_inflight:
                     send_w = pending_weight_tasks > 0
                     if send_w:
                         pending_weight_tasks -= 1
                     in_flight.append(pool.apply_async(_worker_play_one, (_make_args(send_w),)))
+                
                 import time
-                # 小睡一下，降低 busy-wait（不影響吞吐）
                 time.sleep(0.002)
 
         finally:
@@ -1753,8 +2448,9 @@ class ConnectXTrainer:
             except Exception:
                 pass
 
-        logger.info("✅ 完全流水線訓練完成")
+        logger.info("✅ 漸進式難度訓練完成")
         return self.agent
+
 
     def _record_game_frames(self, opponent: str = 'tactical', max_moves: int = 50):
         """遊玩一局並記錄每步的棋盤影格（6x7數組）。"""
@@ -1968,8 +2664,11 @@ def main():
             logger.info("未設置 TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID，略過訊息通知。")
             return
         try:
+            import requests
             base = f"https://api.telegram.org/bot{token}/sendMessage"
 
+            payload = {"chat_id": chat_id, "text": msg}
+            r = requests.post(base, data=payload)
             logger.info("已發送 Telegram 通知。")
         except Exception as e:
             logger.warning(f"Telegram 發送失敗: {e}")
@@ -2003,7 +2702,7 @@ def main():
             ckpt_to_load = choose_latest_checkpoint_by_name(files)
 
     logger.info(f"ckpt_to_load: {ckpt_to_load}")
-
+    send_telegram("使用: "+ckpt_to_load +" model來繼續")
     if ckpt_to_load:
         loaded = trainer.load_checkpoint(ckpt_to_load)
         if not loaded:
@@ -2020,6 +2719,7 @@ def main():
         if use_parallel:
             logger.info("使用平行蒐集進行訓練 train_parallel()")
             trainer.train_parallel()
+            # trainer.train_with_ray()
         else:
             logger.info("使用單執行緒訓練 train()")
            
@@ -2028,12 +2728,13 @@ def main():
         err = e
         logger.error(f"訓練過程發生錯誤: {e}\n{traceback.format_exc()}")
     finally:
+        pass
         # 儲存最後檢查點
-        ts_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-        try:
-            trainer.save_checkpoint(f"final_{ts_tag}.pt")
-        except Exception as se:
-            logger.warning(f"保存最終檢查點失敗: {se}")
+        # ts_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # try:
+            # trainer.save_checkpoint(f"final_{ts_tag}.pt")
+        # except Exception as se:
+            # logger.warning(f"保存最終檢查點失敗: {se}")
 
     # --- notify ---
 

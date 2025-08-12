@@ -82,6 +82,10 @@ class ConnectXGUI(QMainWindow):
         self.ai_thread = None
         # 先手選擇：預設人類先手
         self.ai_starts = False
+        # 動畫狀態
+        self.animating = False
+        self.animation_timer = None
+        self.animation_interval_ms = 60  # 每格下落時間
         
         self.init_ui()
         
@@ -382,8 +386,8 @@ class ConnectXGUI(QMainWindow):
         return all(self.board[0][col] != 0 for col in range(self.cols))
     
     def human_move(self, col):
-        """處理人類玩家移動"""
-        if self.game_over or self.ai_thinking or self.current_player != 1:
+        """處理人類玩家移動（加入動畫）"""
+        if self.game_over or self.ai_thinking or self.current_player != 1 or self.animating:
             return
             
         if not self.is_valid_move(col):
@@ -394,11 +398,12 @@ class ConnectXGUI(QMainWindow):
             msg.exec_()
             return
         
-        # 執行移動
-        if self.make_move(col, 1):
-            self.update_board_display()
-            
-            # 檢查是否獲勝
+        target_row = self.get_drop_row(col)
+        if target_row < 0:
+            return
+
+        def after_animation():
+            # 勝負檢查
             if self.check_win(1):
                 self.game_over = True
                 self.status_label.setText("🎉 恭喜！你贏了！")
@@ -426,9 +431,84 @@ class ConnectXGUI(QMainWindow):
                 msg.exec_()
                 return
             
-            # 切換到AI回合
+            # 交給 AI
             self.current_player = 2
+            self.enable_buttons()  # 先解除，ai_turn 會再關閉
             self.ai_turn()
+
+        # 啟動動畫
+        self.animate_drop(col, target_row, 1, after_animation)
+    
+    def get_drop_row(self, col: int) -> int:
+        """回傳該列可以落子的最底 row，若無則 -1"""
+        if not (0 <= col < self.cols):
+            return -1
+        for r in range(self.rows - 1, -1, -1):
+            if self.board[r][col] == 0:
+                return r
+        return -1
+
+    def animate_drop(self, col: int, target_row: int, player: int, finished_cb):
+        """以動畫方式將棋子由頂部落到 target_row。
+        finished_cb: 動畫完成後呼叫 (會在最後真正寫入 board 並刷新 / 呼叫後續邏輯)
+        """
+        if self.animating:
+            return
+        self.animating = True
+        # 禁用互動
+        self.disable_buttons()
+        token = "🔴" if player == 1 else "🟡"
+        empty_style = """
+            QLabel {background-color: #ecf0f1; border: 2px solid #bdc3c7; border-radius:5px;}
+        """
+        # 預先記錄經過的 cell 以便清空
+        path_rows = list(range(0, target_row + 1))
+        current_index = {"i": 0}
+
+        def step():
+            i = current_index["i"]
+            # 清除上一格（非最上第一格）
+            if i > 0:
+                prev_row = path_rows[i - 1]
+                # 若該格在 board 中還是空的才重畫成空（避免覆寫既有棋子）
+                if self.board[prev_row][col] == 0:
+                    self.cells[prev_row][col].setText("⚪")
+                    self.cells[prev_row][col].setStyleSheet(empty_style)
+            # 在目前格顯示 token（僅暫時顯示，不修改 board）
+            row_show = path_rows[i]
+            self.cells[row_show][col].setText(token)
+            # 簡單著色
+            if player == 1:
+                self.cells[row_show][col].setStyleSheet("""
+                    QLabel {background-color: #ffe6e6; border:2px solid #ff9999; border-radius:5px;}
+                """)
+            else:
+                self.cells[row_show][col].setStyleSheet("""
+                    QLabel {background-color: #fff3cd; border:2px solid #ffcc66; border-radius:5px;}
+                """)
+            current_index["i"] += 1
+            if current_index["i"] >= len(path_rows):
+                # 動畫完成 -> 實際落子
+                if self.board[target_row][col] == 0:
+                    self.board[target_row][col] = player
+                # 刷新整盤保證樣式統一
+                self.update_board_display()
+                self.animating = False
+                if self.animation_timer is not None:
+                    self.animation_timer.stop()
+                    self.animation_timer.deleteLater()
+                    self.animation_timer = None
+                # 呼叫回調
+                if finished_cb:
+                    finished_cb()
+                return
+
+        # 建立 QTimer 逐步執行
+        self.animation_timer = QTimer(self)
+        self.animation_timer.timeout.connect(step)
+        self.animation_timer.start(self.animation_interval_ms)
+        # 立即執行第一步
+        step()
     
     def ai_turn(self):
         """AI回合"""
@@ -446,19 +526,28 @@ class ConnectXGUI(QMainWindow):
         self.ai_thread.start()
     
     def execute_ai_move(self, move):
-        """執行AI移動"""
+        """執行AI移動（加入動畫）"""
         self.ai_thinking = False
         
-        if move == -1 or self.game_over:
+        if move == -1 or self.game_over or self.animating:
             self.status_label.setText("❌ AI無法移動")
             self.status_label.setStyleSheet("color: #e74c3c; font-weight: bold;")
             return
         
-        # 執行AI移動
-        if self.make_move(move, 2):
-            self.update_board_display()
-            
-            # 檢查AI是否獲勝
+        if not self.is_valid_move(move):
+            # 找備選
+            for c in range(self.cols):
+                if self.is_valid_move(c):
+                    move = c; break
+            else:
+                self.status_label.setText("❌ AI無法移動")
+                return
+        target_row = self.get_drop_row(move)
+        if target_row < 0:
+            self.status_label.setText("❌ AI無法移動")
+            return
+
+        def after_animation():
             if self.check_win(2):
                 self.game_over = True
                 self.status_label.setText("🤖 AI獲勝！")
@@ -486,11 +575,12 @@ class ConnectXGUI(QMainWindow):
                 msg.exec_()
                 return
             
-            # 切換回人類回合
             self.current_player = 1
             self.status_label.setText("🔴 你的回合！")
             self.status_label.setStyleSheet("color: white; font-weight: bold;")
             self.enable_buttons()
+
+        self.animate_drop(move, target_row, 2, after_animation)
     
     def disable_buttons(self):
         """禁用列按鈕"""
@@ -513,6 +603,7 @@ class ConnectXGUI(QMainWindow):
         self.board = np.zeros((self.rows, self.cols), dtype=int)
         self.game_over = False
         self.ai_thinking = False
+        self.animating = False
         self.update_board_display()
         
         # 根據先手選擇設定當前玩家與狀態
