@@ -385,6 +385,217 @@ _WORKER = {
     "policy_version": -1,  # 尚未載入任何版本
 }
 
+def count_open_threats(board_flat, mark, threat_length):
+    """Count open threat patterns of given length for a player.
+    
+    An 'open' threat means the pattern can potentially be extended to 4-in-a-row.
+    For example: [0, mark, mark, 0] is an open 2-threat.
+    """
+    grid = flat_to_2d(board_flat)
+    count = 0
+    directions = [(1,0), (0,1), (1,1), (-1,1)]  # horizontal, vertical, diagonal
+    
+    for r in range(6):
+        for c in range(7):
+            for dr, dc in directions:
+                # Check if we can fit a 4-length pattern starting from (r,c)
+                if not (0 <= r + 3*dr < 6 and 0 <= c + 3*dc < 7):
+                    continue
+                
+                # Extract 4-cell window
+                window = []
+                for i in range(4):
+                    rr, cc = r + i*dr, c + i*dc
+                    window.append(grid[rr][cc])
+                
+                # Count marks in window
+                mark_count = window.count(mark)
+                opp_count = window.count(3 - mark)
+                empty_count = window.count(0)
+                
+                # Check if it's an open threat of desired length
+                if mark_count == threat_length and opp_count == 0 and empty_count == (4 - threat_length):
+                    count += 1
+    
+    return count
+
+def count_center_control(board_flat, mark):
+    """Count pieces in center and adjacent columns with weighted scoring."""
+    grid = flat_to_2d(board_flat)
+    center_count = sum(1 for r in range(6) if grid[r][3] == mark)  # center column
+    adjacent_count = 0
+    for col in [2, 4]:  # adjacent to center
+        adjacent_count += sum(1 for r in range(6) if grid[r][col] == mark)
+    return center_count, adjacent_count
+
+def has_immediate_win(board_flat, mark):
+    """Check if player has an immediate winning move available."""
+    mock_agent = type('MockAgent', (), {
+        'get_valid_actions': lambda self, board: [c for c in range(7) if flat_to_2d(board)[0][c] == 0]
+    })()
+    return if_i_can_win(board_flat, mark, mock_agent) is not None
+
+def compute_potential_function(board_flat, mark, gamma=0.99):
+    """Compute potential function Φ(s) for potential-based reward shaping.
+    
+    Φ(s) = 0.02·center_diff + 0.05·(my_open2 - opp_open2) + 0.12·(my_open3 - opp_open3)
+           + 0.40·I(my_immediate_win) - 0.40·I(opp_immediate_win)
+    """
+    opp_mark = 3 - mark
+    
+    # Center control difference
+    my_center, my_adjacent = count_center_control(board_flat, mark)
+    opp_center, opp_adjacent = count_center_control(board_flat, opp_mark)
+    center_diff = (my_center + 0.5 * my_adjacent) - (opp_center + 0.5 * opp_adjacent)
+    
+    # Open threat differences
+    my_open2 = count_open_threats(board_flat, mark, 2)
+    opp_open2 = count_open_threats(board_flat, opp_mark, 2)
+    open2_diff = my_open2 - opp_open2
+    
+    my_open3 = count_open_threats(board_flat, mark, 3)
+    opp_open3 = count_open_threats(board_flat, opp_mark, 3)
+    open3_diff = my_open3 - opp_open3
+    
+    # Immediate win indicators
+    my_immediate_win = 1.0 if has_immediate_win(board_flat, mark) else 0.0
+    opp_immediate_win = 1.0 if has_immediate_win(board_flat, opp_mark) else 0.0
+    
+    # Combine into potential function
+    potential = (0.02 * center_diff + 
+                0.05 * open2_diff + 
+                0.12 * open3_diff + 
+                0.40 * my_immediate_win - 
+                0.40 * opp_immediate_win)
+    
+    return potential
+
+def calculate_custom_reward_global(prev_board, action, new_board, mark, valid_actions, game_over=False, winner=None, move_count=0, debug=False, gamma=0.99):
+    """Enhanced reward function with potential-based shaping for PPO training.
+    
+    Combines sparse terminal rewards with dense tactical shaping using potential-based
+    reward shaping to maintain policy invariance.
+    
+    Terminal rewards:
+    - Win: +1.0 - 0.01 * move_count (prefer faster wins)
+    - Loss: -1.0 + 0.01 * move_count (prefer prolonging when losing)  
+    - Draw: -0.05 (push for decisive results)
+    - Illegal move: -1.0
+    
+    Dense shaping via potential function:
+    - Center control, open threats, immediate wins/losses
+    - Applied as: γ·Φ(s') - Φ(s) to maintain optimality
+    
+    Step penalties:
+    - Small time penalty: -0.001 per move
+    - Block opponent win: +0.20
+    - Create blunder: -0.30
+    
+    Args:
+        prev_board: Board state before action (42-length list)
+        action: Action taken (0-6)
+        new_board: Board state after action (42-length list)  
+        mark: Current player mark (1 or 2)
+        valid_actions: Legal actions before move
+        game_over: Whether game ended this step
+        winner: Winner (1, 2, or None for draw)
+        move_count: Current move number
+        debug: Whether to print debug info
+        gamma: Discount factor for potential shaping
+        
+    Returns:
+        float: Total shaped reward clipped to [-1, 1]
+    """
+    # Start with sparse reward
+    sparse_reward = 0.0
+    opp_mark = 3 - mark
+    
+    # 1. Illegal move penalty
+    if action not in valid_actions:
+        if debug:
+            print(f"[DEBUG] Illegal move penalty: action={action}, valid={valid_actions}")
+        return -1.0  # Terminal penalty, no need for other calculations
+    
+    # 2. Terminal rewards (game over)
+    if game_over:
+        if winner == mark:
+            # Win bonus, with preference for faster wins
+            sparse_reward = 1.0 - 0.01 * move_count
+            if debug:
+                print(f"[DEBUG] Win reward: +{sparse_reward:.3f} (move {move_count})")
+        elif winner == opp_mark:
+            # Loss penalty, slightly less harsh for longer games (reward prolonging)
+            sparse_reward = -1.0 + 0.01 * move_count
+            if debug:
+                print(f"[DEBUG] Loss penalty: {sparse_reward:.3f} (move {move_count})")
+        else:
+            # Draw - slightly negative to encourage decisive play
+            sparse_reward = -0.05
+            if debug:
+                print(f"[DEBUG] Draw penalty: -0.05")
+    
+    # 3. Step-based tactical rewards (non-terminal)
+    step_reward = 0.0
+    
+    # Small time penalty to prevent dithering
+    step_reward -= 0.001
+    
+    # Check if we blocked an opponent's immediate win
+    try:
+        prev_grid = flat_to_2d(prev_board)
+        prev_valid_actions = [c for c in range(7) if prev_grid[0][c] == 0]
+        
+        blocked_win = False
+        for opp_action in prev_valid_actions:
+            if is_winning_move(prev_board, opp_action, opp_mark) and opp_action == action:
+                step_reward += 0.20
+                blocked_win = True
+                if debug:
+                    print(f"[DEBUG] Blocked opponent win: +0.20 (column {action})")
+                break
+    except Exception:
+        pass
+    
+    # Check if we created a blunder (opponent can win immediately after our move)
+    try:
+        if not game_over:
+            new_grid = flat_to_2d(new_board)
+            new_valid_actions = [c for c in range(7) if new_grid[0][c] == 0]
+            
+            for opp_action in new_valid_actions:
+                if is_winning_move(new_board, opp_action, opp_mark):
+                    step_reward -= 0.30
+                    if debug:
+                        print(f"[DEBUG] Created blunder: -0.30 (opponent can win at {opp_action})")
+                    break
+    except Exception:
+        pass
+    
+    # 4. Potential-based shaping (the main tactical component)
+    shaping_reward = 0.0
+    try:
+        phi_prev = compute_potential_function(prev_board, mark, gamma)
+        phi_curr = compute_potential_function(new_board, mark, gamma)
+        shaping_reward = gamma * phi_curr - phi_prev
+        
+        if debug:
+            print(f"[DEBUG] Potential shaping: {shaping_reward:.3f} (Φ_prev={phi_prev:.3f}, Φ_curr={phi_curr:.3f})")
+    except Exception as e:
+        if debug:
+            print(f"[DEBUG] Potential function failed: {e}")
+        shaping_reward = 0.0
+    
+    # 5. Combine all components
+    total_reward = sparse_reward + step_reward + shaping_reward
+    
+    # 6. Clip to reasonable range to maintain PPO stability
+    total_reward = max(-1.0, min(1.0, total_reward))
+    
+    if debug:
+        print(f"[DEBUG] Final reward: {total_reward:.3f} = sparse({sparse_reward:.3f}) + step({step_reward:.3f}) + shaping({shaping_reward:.3f})")
+    
+    return total_reward
+
 def _worker_init_persistent(agent_cfg):
     # 關 GPU、限執行緒，避免 CPU oversubscription
     os.environ.setdefault('CUDA_VISIBLE_DEVICES', '')
@@ -443,20 +654,25 @@ def _worker_play_one(args):
             # 初期：純隨機和只會贏的對手
             opponent_type = random.choice(['pure_random', 'win_only'])
         elif current_win_rate < 0.4:
-            # 進階：加入只會防守的對手
-            opponent_type = random.choice(['pure_random', 'win_only', 'defensive_only'])
+            # 進階：加入只會防守的對手和戰術開局
+            opponent_type = random.choice(['pure_random', 'win_only', 'defensive_only', 'tactical_opening'])
         elif current_win_rate < 0.55:
-            # 中期：加入偏好中央和弱戰術對手
-            opponent_type = random.choice(['win_only', 'defensive_only', 'center_bias', 'weak_tactical'])
+            # 中期：加入偏好中央和弱戰術對手，增加戰術開局比例
+            opponent_type = random.choice(['win_only', 'defensive_only', 'center_bias', 'weak_tactical', 'tactical_opening', 'tactical_opening'])
         elif current_win_rate < 0.7:
-            # 後期：加入容易犯錯的對手
-            opponent_type = random.choice(['center_bias', 'weak_tactical', 'mistake_prone'])
+            # 後期：加入容易犯錯的對手，強化戰術開局
+            opponent_type = random.choice(['center_bias', 'weak_tactical', 'mistake_prone', 'tactical_opening', 'tactical_opening'])
         else:
-            # 高階：使用完整戰術對手
-            opponent_type = random.choice(['random', 'minimax', 'self'])
+            # 高階：使用完整戰術對手，主要使用戰術開局
+            opponent_type = random.choice(['random', 'minimax', 'self', 'tactical_opening', 'tactical_opening', 'tactical_opening'])
         
         player2_prob = float(args.get('player2_training_prob', 0.5))
-        training_player = int(np.random.choice([1, 2], p=[1.0 - player2_prob, player2_prob]))
+        
+        # 特殊處理：如果使用戰術開局對手，強制對手為 player 1，訓練玩家為 player 2
+        if opponent_type == 'tactical_opening':
+            training_player = 2  # 訓練玩家強制為後手
+        else:
+            training_player = int(np.random.choice([1, 2], p=[1.0 - player2_prob, player2_prob]))
 
         transitions = []
         move_count, max_moves = 0, 50
@@ -464,22 +680,36 @@ def _worker_play_one(args):
         with torch.no_grad():
             while not env.done and move_count < max_moves:
                 actions = []
+                # 記錄本回合開始時的棋盤狀態
+                round_start_board = None
                 for player_idx in range(2):
                     if env.state[player_idx]['status'] == 'ACTIVE':
                         board, current_player = agent.extract_board_and_mark(env.state, player_idx)
                         valid_actions = agent.get_valid_actions(board)
+                        
+                        # 記錄訓練玩家動作前的棋盤狀態
+                        if current_player == training_player:
+                            round_start_board = board.copy()
+                        
                         if current_player == training_player:
                             state = agent.encode_state(board, current_player)
                             action, prob, value = agent.select_action(state, valid_actions, training=True)
-                            transitions.append({
+                            
+                            # 記錄完整信息以便計算自定義獎勵
+                            transition_data = {
                                 'state': state,
                                 'action': int(action),
                                 'prob': float(prob),
                                 'value': float(value),
+                                'board_before': board.copy(),  # 動作前棋盤
+                                'valid_actions': valid_actions.copy(),  # 合法動作
+                                'mark': current_player,  # 玩家標記
                                 'training_player': training_player,
                                 'opponent_type': opponent_type,
                                 'is_dangerous': bool(if_i_will_lose_at_next(board, int(action), current_player, agent)),
-                            })
+                                'move_index': move_count,  # 回合索引
+                            }
+                            transitions.append(transition_data)
                         else:
                             # 根據選定的對手類型選擇策略
                             if opponent_type == 'pure_random':
@@ -494,6 +724,30 @@ def _worker_play_one(args):
                                 action = weak_tactical_opponent_strategy(board, current_player, valid_actions, agent)
                             elif opponent_type == 'mistake_prone':
                                 action = mistake_prone_opponent_strategy(board, current_player, valid_actions, agent)
+                            elif opponent_type == 'tactical_opening':
+                                # 戰術開局對手：強制先手並使用 3->4->2 開局，然後戰術邏輯
+                                # 只有當此對手是 player 1 (mark==1) 時才使用開局策略
+                                if current_player == 1:
+                                    action = if_i_can_win(board, current_player, agent)
+                                    if action is None:
+                                        action = if_i_will_lose(board, current_player, agent)
+                                    if action is None:
+                                        # 檢查開局序列 3->4->2
+                                        grid = flat_to_2d(board)
+                                        my_tokens = sum(1 for r in range(6) for c in range(7) if grid[r][c] == 1)
+                                        if my_tokens == 0 and 3 in valid_actions:
+                                            action = 3
+                                        elif my_tokens == 1 and 4 in valid_actions:
+                                            action = 4
+                                        elif my_tokens == 2 and 2 in valid_actions:
+                                            action = 2
+                                        else:
+                                            # 開局完成後使用安全策略
+                                            safe = safe_moves(board, current_player, valid_actions, agent)
+                                            action = random.choice(safe) if safe else random.choice(valid_actions)
+                                else:
+                                    # 如果不是先手，使用普通戰術策略
+                                    action = random_opponent_strategy(board, current_player, valid_actions, agent)
                             elif opponent_type == 'random':
                                 action = random_opponent_strategy(board, current_player, valid_actions, agent)
                             elif opponent_type == 'minimax':
@@ -503,10 +757,22 @@ def _worker_play_one(args):
                         actions.append(int(action))
                     else:
                         actions.append(0)
+                
+                # 執行動作
                 try:
                     env.step(actions)
                 except Exception:
                     break
+                
+                # 記錄動作後的棋盤狀態（針對訓練玩家的最後一個 transition）
+                if transitions and round_start_board is not None:
+                    try:
+                        # 獲取動作後的棋盤狀態
+                        post_board, _ = agent.extract_board_and_mark(env.state, 0)  # 使用player 0視角獲取棋盤
+                        transitions[-1]['board_after'] = post_board.copy()
+                    except Exception:
+                        transitions[-1]['board_after'] = round_start_board.copy()  # 退化到動作前狀態
+                
                 move_count += 1
 
         try:
@@ -514,13 +780,75 @@ def _worker_play_one(args):
         except Exception:
             player_result = 0
 
+        try:
+            player_result = env.state[0]['reward'] if training_player == 1 else env.state[1]['reward']
+        except Exception:
+            player_result = 0
+
+        # 計算自定義獎勵並分配給所有 transitions
+        final_transitions = []
+        for i, transition in enumerate(transitions):
+            # 計算基礎環境獎勵
+            base_reward = float(player_result)
+            
+            # 計算自定義獎勵（使用新的全局函數）
+            custom_reward = 0.0
+            if 'board_before' in transition and 'board_after' in transition:
+                try:
+                    board_before = transition['board_before']
+                    board_after = transition['board_after']
+                    action = transition['action']
+                    valid_actions = transition['valid_actions']
+                    mark = transition['mark']
+                    move_index = transition['move_index']
+                    total_moves = len(transitions)
+                    
+                    # 判斷遊戲是否在此步結束
+                    is_last_move = (i == len(transitions) - 1)
+                    game_over = is_last_move
+                    winner = None
+                    if game_over:
+                        if player_result == 1:
+                            winner = mark  # 我方勝利
+                        elif player_result == -1:
+                            winner = 3 - mark  # 對方勝利
+                        # player_result == 0 時 winner 保持 None (平局)
+                    
+                    # 使用新的全局自定義獎勵函數
+                    custom_reward = calculate_custom_reward_global(
+                        prev_board=board_before,
+                        action=action,
+                        new_board=board_after,
+                        mark=mark,
+                        valid_actions=valid_actions,
+                        game_over=game_over,
+                        winner=winner,
+                        move_count=i+1,
+                        gamma=getattr(agent, 'gamma', 0.99),  # Use agent's gamma if available
+                        debug=False  # Set to True for detailed reward logging
+                    )
+                    
+                except Exception as e:
+                    # 如果自定義獎勵計算失敗，使用默認值
+                    custom_reward = 0.0
+            
+            # 合併基礎獎勵和自定義獎勵
+            final_reward = base_reward + custom_reward
+            
+            # 為每個transition添加最終獎勵
+            transition['reward'] = float(final_reward)
+            transition['custom_reward'] = float(custom_reward)
+            transition['base_reward'] = float(base_reward)
+            final_transitions.append(transition)
+
         return {
-            'transitions': transitions,
+            'transitions': final_transitions,
             'training_player': training_player,
             'player_result': int(player_result),
-            'game_length': len(transitions),
+            'game_length': len(final_transitions),
             'opponent_type': opponent_type,
             'policy_version_used': _WORKER["policy_version"],
+            'custom_rewards_applied': len([t for t in final_transitions if 'custom_reward' in t])
         }
     except Exception as e:
         return {
@@ -851,6 +1179,64 @@ class PPOAgent:
             prob = float(masked[action].item())
             return action, prob, float(value.item())
 
+    def get_action_scores(self, state, valid_actions):
+        """取得目前策略對每個動作的打分 / 概率與 value。
+
+        Args:
+            state: 126/flattened state (或 list/np.array)
+            valid_actions: 可落子列表
+
+        Returns dict:
+            {
+              'valid_actions': [...],
+              'raw_policy': list[7],          # 原始 policy_net softmax 輸出
+              'masked_policy': list[7],       # 只在 valid 上重新正規化後的分佈
+              'logits': list[7],              # 對應 masked_policy 的 log(prob)
+              'value': float,                 # 狀態價值 V(s)
+              'entropy': float,               # masked distribution entropy
+              'action_ranking': [(action, prob), ...]  # 依 masked prob 由高到低
+            }
+        """
+        self.policy_net.eval()
+        with torch.no_grad():
+            s = torch.as_tensor(state, dtype=torch.float32, device=self.device).view(1, -1)
+            probs, value = self.policy_net(s)  # probs: (1,7)
+            probs = probs.squeeze(0).clamp_min(1e-8)
+            if not valid_actions:
+                valid_actions = list(range(7))
+            mask = torch.zeros_like(probs)
+            mask[valid_actions] = 1.0
+            masked = probs * mask
+            if masked.sum() <= 0:
+                masked = mask / mask.sum()  # uniform on valid
+            else:
+                masked = masked / masked.sum()
+            entropy = float(-(masked * (masked.add(1e-8).log())).sum().item())
+            ranking = sorted([(int(a), float(masked[a].item())) for a in range(7)], key=lambda x: x[1], reverse=True)
+            return {
+                'valid_actions': list(map(int, valid_actions)),
+                'raw_policy': [float(p) for p in probs.tolist()],
+                'masked_policy': [float(p) for p in masked.tolist()],
+                'logits': [float(math.log(p + 1e-8)) for p in masked.tolist()],
+                'value': float(value.item()),
+                'entropy': entropy,
+                'action_ranking': ranking,
+            }
+
+    def debug_print_action_scores(self, board, mark):
+        """便利函式：直接輸出某盤面下每個動作概率/排名。"""
+        try:
+            state = self.encode_state(board, mark)
+        except Exception:
+            return
+        valid = self.get_valid_actions(board)
+        info = self.get_action_scores(state, valid)
+        logger.info(
+            "[ActionScores] mark=%s value=%.4f entropy=%.3f ranking=%s", 
+            mark, info['value'], info['entropy'], info['action_ranking']
+        )
+        return info
+
     def store_transition(self, state, action, prob, reward, done):
         self.memory.append((state, action, prob, reward, done))
 
@@ -1065,6 +1451,12 @@ class PPOAgent:
         Args:
             use_batch_method: 如果為True，使用update_policy_from_batch方法
         """
+        # 釋放未使用的 CUDA 快取（減少碎片化）
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
         if len(self.memory) < self.config['min_batch_size']:
             return None
 
@@ -1167,6 +1559,12 @@ class PPOAgent:
 
         # 清空記憶體
         self.memory.clear()
+        # 再次嘗試釋放快取，為下次更新準備
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
         # --- Stuck detection on entropy ---
         self.update_step += 1
@@ -1178,11 +1576,8 @@ class PPOAgent:
                 if mean_ent < self.entropy_threshold and (self.update_step - self.last_partial_reset_update) >= self.reset_cooldown_updates:
                     logger.info(f"🔁 低熵觸發部分重置: mean_entropy={mean_ent:.3f} < thr={self.entropy_threshold:.3f}")
                     self.partial_reset('res_blocks_and_head')
-            except Exception as e:
-                try:
-                    logger.debug(f"entropy reset check failed: {e}")
-                except Exception:
-                    pass
+            except Exception:
+                pass
         return {
             'policy_loss': policy_loss.item(),
             'value_loss': value_loss.item(),
@@ -1467,6 +1862,162 @@ class ConnectXTrainer:
     def if_i_will_lose_at_next(self, board_flat, move_col, mark):
         return if_i_will_lose_at_next(board_flat, move_col, mark, self.agent)
 
+    # --- Debug / Analysis ---
+    def get_action_score_report(self, board_flat, mark):
+        """回傳目前 PPO 對此盤面 (board_flat) 在 mark 視角下各動作分布與價值。
+        Returns dict (同 PPOAgent.get_action_scores)。"""
+        try:
+            return self.agent.debug_print_action_scores(board_flat, mark)
+        except Exception as e:
+            logger.warning(f"取得動作分數報告失敗: {e}")
+            return None
+
+    # --- Custom Reward System ---
+    def calculate_custom_reward(self, prev_board, action, new_board, mark, valid_actions, game_over=False, winner=None, move_count=0):
+        """計算自定義獎勵/懲罰系統 - 統一調用全域函數
+        
+        這個方法現在是全域 calculate_custom_reward_global 函數的包裝器，
+        確保所有獎勵計算邏輯統一，避免重複代碼。
+        
+        獎勵規則：
+        1. 非法動作懲罰: -1.0
+        2. 勝利獎勵: +2.0  
+        3. 防守獎勵 (擋住對手即將勝利): +1.0
+        4. 威脅懲罰 (忽略對手即將勝利): -0.3
+        5. 錯過勝利機會懲罰: -0.5
+        6. 拖時間獎勵: +0.01 * (回合數-20), 最多+0.2
+        
+        Args:
+            prev_board: 動作前的棋盤狀態 (42-length list)
+            action: 執行的動作 (0-6)
+            new_board: 動作後的棋盤狀態 (42-length list)  
+            mark: 當前玩家標記 (1 or 2)
+            valid_actions: 動作前的合法動作列表
+            game_over: 遊戲是否結束
+            winner: 獲勝者 (1, 2, or None for draw)
+            move_count: 當前回合數
+            
+        Returns:
+            float: 總獎勵/懲罰值
+        """
+        # 調用全域函數進行統一計算
+        total_reward = calculate_custom_reward_global(
+            prev_board=prev_board,
+            action=action,
+            new_board=new_board,
+            mark=mark,
+            valid_actions=valid_actions,
+            game_over=game_over,
+            winner=winner,
+            move_count=move_count,
+            gamma=self.gamma
+        )
+        
+        # 添加詳細的調試日誌（只在類方法中提供）
+        if total_reward != 0.0:
+            opp_mark = 3 - mark
+            debug_info = []
+            
+            # 檢查各種獎勵/懲罰的具體原因
+            if action not in valid_actions:
+                debug_info.append(f"非法動作懲罰: action={action}, valid={valid_actions}")
+            elif game_over and winner == mark:
+                debug_info.append(f"勝利獎勵: +2.0")
+            else:
+                # 檢查防守獎勵
+                try:
+                    prev_grid = flat_to_2d(prev_board)
+                    prev_valid_actions = [c for c in range(7) if prev_grid[0][c] == 0]
+                    for opp_action in prev_valid_actions:
+                        if is_winning_move(prev_board, opp_action, opp_mark) and opp_action == action:
+                            debug_info.append(f"防守成功獎勵: +1.0 (擋住列{action})")
+                            break
+                except Exception:
+                    pass
+                
+                # 檢查威脅懲罰
+                try:
+                    opponent_winning_moves = []
+                    for opp_action in prev_valid_actions:
+                        if is_winning_move(prev_board, opp_action, opp_mark):
+                            opponent_winning_moves.append(opp_action)
+                    if opponent_winning_moves and action not in opponent_winning_moves:
+                        debug_info.append(f"忽略對手威脅懲罰: -0.3 (對手可勝利於{opponent_winning_moves}, 我選擇{action})")
+                except Exception:
+                    pass
+                
+                # 檢查錯過勝利機會懲罰
+                try:
+                    winning_move = self.if_i_can_win(prev_board, mark)
+                    if winning_move is not None and action != winning_move:
+                        debug_info.append(f"錯過勝利機會懲罰: -0.5 (可勝利於列{winning_move}, 卻選擇{action})")
+                except Exception:
+                    pass
+                
+                # 檢查拖時間獎勵
+                if move_count > 20:
+                    drag_reward = min(0.2, (move_count - 20) * 0.01)
+                    debug_info.append(f"拖時間獎勵: +{drag_reward:.3f} (回合{move_count})")
+            
+            # 輸出調試信息
+            for info in debug_info:
+                logger.debug(info)
+        
+        return total_reward
+
+    def apply_custom_rewards_to_transitions(self, transitions, game_result, move_count):
+        """將自定義獎勵應用到 transition 序列中
+        
+        Args:
+            transitions: list of dict, 每個包含 {'state', 'action', 'prob', 'board_before', 'board_after', 'mark', 'valid_actions'}
+            game_result: 遊戲結果 (1=我方勝, -1=我方敗, 0=平局)
+            move_count: 總回合數
+            
+        Returns:
+            list: 更新後的 transitions，每個添加了 'custom_reward' 字段
+        """
+        if not transitions:
+            return transitions
+            
+        updated_transitions = []
+        for i, tr in enumerate(transitions):
+            # 基本資訊
+            prev_board = tr.get('board_before', [0]*42)
+            action = tr.get('action', 0)
+            new_board = tr.get('board_after', [0]*42)
+            mark = tr.get('mark', 1)
+            valid_actions = tr.get('valid_actions', list(range(7)))
+            
+            # 判斷遊戲是否在此步結束
+            is_last_move = (i == len(transitions) - 1)
+            game_over = is_last_move
+            winner = None
+            if game_over:
+                if game_result == 1:
+                    winner = mark  # 我方勝利
+                elif game_result == -1:
+                    winner = 3 - mark  # 對方勝利
+                # game_result == 0 時 winner 保持 None (平局)
+            
+            # 計算自定義獎勵 - 使用實例方法版本
+            custom_reward = self.calculate_custom_reward(
+                prev_board=prev_board,
+                action=action, 
+                new_board=new_board,
+                mark=mark,
+                valid_actions=valid_actions,
+                game_over=game_over,
+                winner=winner,
+                move_count=i+1
+            )
+            
+            # 複製 transition 並添加自定義獎勵
+            updated_tr = tr.copy()
+            updated_tr['custom_reward'] = custom_reward
+            updated_transitions.append(updated_tr)
+            
+        return updated_transitions
+
     # NEW: list all moves that do NOT give opponent an immediate winning reply
     def _safe_moves(self, board_flat, mark, valid_actions):
         return safe_moves(board_flat, mark, valid_actions, self.agent)
@@ -1477,7 +2028,7 @@ class ConnectXTrainer:
 
     # --- Random opening tactic for first player (mark==1) ---
     def _random_opening_move(self, board_flat, mark, valid_actions):
-        """If this random player is the starter (mark==1), follow opening: 3 -> 2 -> 4 -> then 5 or 1 depending on top row empty.
+        """If this random player is the starter (mark==1), follow opening: 3 -> 4 -> 2 -> then 5 or 1 depending on top row empty.
         Returns a move or None if not applicable."""
         try:
             if int(mark) != 1:
@@ -1492,10 +2043,10 @@ class ConnectXTrainer:
             # Opening sequence by own move index (before placing this move)
             if my_tokens == 0 and 3 in valid_actions:
                 return 3
-            if my_tokens == 1 and 2 in valid_actions:
-                return 2
-            if my_tokens == 2 and 4 in valid_actions:
+            if my_tokens == 1 and 4 in valid_actions:
                 return 4
+            if my_tokens == 2 and 2 in valid_actions:
+                return 2
             if my_tokens == 3:
                 top5_empty = (grid[0][5] == 0)
                 top1_empty = (grid[0][1] == 0)
@@ -1561,10 +2112,12 @@ class ConnectXTrainer:
                         board, mark = self.agent.extract_board_and_mark(env.state, p)
                         state = self.agent.encode_state(board, mark)
                         valid = self.agent.get_valid_actions(board)
+                        # Force tactical random opponent to be player 0 (first/red player)
+                        # Agent is always player 1 (second/yellow player)
                         if p == 0:
-                            a, _, _ = self.agent.select_action(state, valid, training=False)
-                        else:
                             a = self._tactical_random_opening_agent(board, mark, valid)
+                        else:
+                            a, _, _ = self.agent.select_action(state, valid, training=False)
                         actions.append(int(a))
                     else:
                         actions.append(0)
@@ -1573,9 +2126,9 @@ class ConnectXTrainer:
                 except Exception:
                     break
                 move_count += 1
-        # 回傳玩家1結果（我方）
+        # 回傳玩家2結果（我方，現在是後手）
         try:
-            return 1 if env.state[0]['reward'] == 1 else (0 if env.state[0]['reward'] == 0 else -1)
+            return 1 if env.state[1]['reward'] == 1 else (0 if env.state[1]['reward'] == 0 else -1)
         except Exception:
             return 0
 
@@ -1668,10 +2221,12 @@ class ConnectXTrainer:
                             board, mark = self.agent.extract_board_and_mark(env.state, p)
                             state = self.agent.encode_state(board, mark)
                             valid = self.agent.get_valid_actions(board)
+                            # Force tactical random opponent to be player 0 (first/red player)
+                            # Agent is always player 1 (second/yellow player)
                             if p == 0:
-                                a, _, _ = self.agent.select_action(state, valid, training=False)
-                            else:
                                 a = self._tactical_random_opening_agent(board, mark, valid)
+                            else:
+                                a, _, _ = self.agent.select_action(state, valid, training=False)
                             actions.append(int(a))
                         else:
                             actions.append(0)
@@ -1681,7 +2236,7 @@ class ConnectXTrainer:
                         break
                     moves += 1
             try:
-                res = env.state[0]['reward']
+                res = env.state[1]['reward']  # Check player 1 (agent) result
                 if res == 1:
                     wins += 1
                 elif res == -1:
@@ -1766,7 +2321,8 @@ class ConnectXTrainer:
         wins = 0
         draws = 0
         for _ in range(max(1, int(games))):
-            r = self._play_one_game_self_tactical(main_as_player1=True)
+            # Force agent to be player 1 (second player), tactical opponent always player 0
+            r = self._play_one_game_self_tactical(main_as_player1=False)
             if r == 1:
                 wins += 1
             elif r == 0:
@@ -1777,8 +2333,8 @@ class ConnectXTrainer:
         num_actors = int(tcfg.get('num_workers',  max(1, (os.cpu_count() or 2) - 1)))
         episodes_per_task = int(tcfg.get('episodes_per_update', 8))  # 每個 actor 一次打幾局
         max_episodes = int(tcfg.get('max_episodes', 100_000))
-        eval_frequency = int(tcfg.get('eval_frequency', 200))
-        eval_games = int(tcfg.get('eval_games', 30))
+        eval_frequency = int(self.config.get('evaluation', {}).get('frequency', 200))
+        eval_games = int(self.config.get('evaluation', {}).get('games', 30))
         win_scale = float(tcfg.get('win_reward_scaling', 1.0))
         loss_scale = float(tcfg.get('loss_penalty_scaling', 1.0))
         danger_scale = float(self.config.get('agent', {}).get('tactical_bonus', 0.1))
@@ -1798,7 +2354,21 @@ class ConnectXTrainer:
 
         # 啟動 Ray
         if not ray.is_initialized():
-            ray.init(ignore_reinit_error=True, include_dashboard=False)
+            ray.init(
+                ignore_reinit_error=True,
+                include_dashboard=False,
+                runtime_env={
+                    'excludes': [
+                        '.git/',
+                        '/pycache/',
+                        'checkpoints/',
+                        'videos/',
+                        'game_videos/',
+                        'game_visualizations/**'
+                    ]
+                }
+            )
+
 
         # 建 actors
         actors = [RolloutActor.remote(self.config['agent']) for _ in range(num_actors)]
@@ -1822,6 +2392,24 @@ class ConnectXTrainer:
 
         episodes_done_total = len(self.episode_rewards)
         best_score = -1.0
+        # Track recent win rate for difficulty reporting
+        recent_results = []  # keep last ~1000 results (1=win, 0=non-win)
+        current_win_rate = 0.0
+        # Next scheduled checkpoints for evaluation/visualization (align to next multiple)
+        if eval_frequency > 0:
+            if episodes_done_total > 0:
+                next_eval_at = ((episodes_done_total // eval_frequency) + 1) * eval_frequency
+            else:
+                next_eval_at = eval_frequency
+        else:
+            next_eval_at = None
+        if visualize_every > 0:
+            if episodes_done_total > 0:
+                next_viz_at = ((episodes_done_total // visualize_every) + 1) * visualize_every
+            else:
+                next_viz_at = visualize_every
+        else:
+            next_viz_at = None
 
         logger.info(f"🚀 Ray Actor 平行訓練啟動：actors={num_actors}, episodes_per_task={episodes_per_task}")
 
@@ -1834,8 +2422,12 @@ class ConnectXTrainer:
 
                 # 立刻補件
                 finished_id = done_ids[0]
-                # 找到是哪個 actor 完成（簡單做法：再派給全部，其中 Ray 會排給空閒的，不需要逐一對應）
-                in_flight.extend([submit(a) for a in actors if len(in_flight) < len(actors)])
+                # 僅補一個新的任務，維持與 actors 數量一致，避免過量提交
+                if len(in_flight) < len(actors):
+                    try:
+                        in_flight.append(submit(rng.choice(actors)))
+                    except Exception:
+                        in_flight.append(submit(actors[0]))
 
                 # 取結果
                 all_transitions, meta = ray.get(finished_id)
@@ -1877,6 +2469,16 @@ class ConnectXTrainer:
                     self.episode_rewards.append(ep_reward_sum)
                     episodes_done_total += 1
 
+                    # Update moving win-rate (requires at least minimal stability window)
+                    try:
+                        recent_results.append(1 if int(result) == 1 else 0)
+                        if len(recent_results) > 1000:
+                            recent_results.pop(0)
+                        if len(recent_results) >= 100:
+                            current_win_rate = sum(recent_results) / float(len(recent_results))
+                    except Exception:
+                        pass
+
                 # 只要資料夠，就多次 SGD 更新（讓 Actor 不停打局）
                 while len(per) >= min_batch_size:
                     batch, idxs, is_weights = per.sample(sgd_batch_size, danger_fraction=danger_fraction)
@@ -1917,30 +2519,65 @@ class ConnectXTrainer:
                     # 只在版本升級點廣播一次（Ray 會並行 set_weights）
                     ray.get([a.set_weights.remote(weights_np, policy_version) for a in actors])
 
-                # 週期性評估與視覺化
-                if eval_frequency > 0 and episodes_done_total > 0 and episodes_done_total % eval_frequency == 0:
+                # 週期性評估（以門檻觸發，避免模數對不齊而永不觸發）
+                if next_eval_at is not None and episodes_done_total >= next_eval_at:
                     metrics = self.evaluate_comprehensive(games=eval_games)
                     score = float(metrics.get('comprehensive_score', 0.0))
+                    score_incl = float(metrics.get('comprehensive_score_incl_self', score))
+                    score_excl = float(metrics.get('comprehensive_score_excl_self', score))
+                    use_self = bool(metrics.get('comprehensive_uses_self_play', False))
                     self.win_rates.append(score)
                     try:
                         self.agent.scheduler.step(score)
                     except Exception:
                         pass
+
+                    # Difficulty label from moving win-rate
+                    if current_win_rate < 0.2:
+                        difficulty = "初級 (純隨機+只會贏)"
+                    elif current_win_rate < 0.4:
+                        difficulty = "初階 (加入防守)"
+                    elif current_win_rate < 0.55:
+                        difficulty = "中階 (偏好中央+弱戰術)"
+                    elif current_win_rate < 0.7:
+                        difficulty = "進階 (容易犯錯)"
+                    else:
+                        difficulty = "高階 (完整戰術)"
+
+                    # Optional PPO diagnostics
+                    ppo_diag = {}
+                    try:
+                        ppo_diag = self.evaluate_ppo_diagnostics(samples=max(3, eval_games // 10)) or {}
+                    except Exception:
+                        ppo_diag = {}
+
                     logger.info(
-                        f"📈 Eps={episodes_done_total} | Score={score:.3f} | "
-                        f"self={metrics.get('self_play', 0):.3f} minimax={metrics.get('vs_minimax', 0):.3f} rand={metrics.get('vs_random', 0):.3f}"
+                        f"📈 Eps={episodes_done_total} | Score={score:.3f} (incl={score_incl:.3f}, excl={score_excl:.3f}, use_self={use_self}) | "
+                        f"win_rate={current_win_rate:.3f} | diff={difficulty} | "
+                        f"self={metrics.get('self_play', 0):.3f} minimax={metrics.get('vs_minimax', 0):.3f} rand={metrics.get('vs_random', 0):.3f} | "
+                        f"ppo(entropy={ppo_diag.get('avg_entropy','n/a')}, value={ppo_diag.get('avg_value','n/a')})"
                     )
+
+                    # Stagnation detection and handling (parity with train_parallel)
+                    try:
+                        if self._detect_convergence_stagnation(episodes_done_total, score):
+                            self._handle_convergence_stagnation(episodes_done_total)
+                    except Exception:
+                        pass
                     if score > best_score:
                         best_score = score
+                        send_telegram(f"🎉 新最佳分數 Eps={episodes_done_total} | Score={best_score:.3f} | ")
                         self.save_checkpoint(f"best_model_wr_{best_score:.3f}.pt")
-
-                if visualize_every > 0 and episodes_done_total > 0 and episodes_done_total % visualize_every == 0:
+                    # 更新下一次評估門檻
+                    next_eval_at += eval_frequency
+                # 週期性視覺化（同樣使用門檻觸發）
+                if next_viz_at is not None and episodes_done_total >= next_viz_at:
                     try:
                         quick_games = max(5, int(eval_games // 2))
                         metrics_v = self.evaluate_comprehensive(games=quick_games)
                         score_v = float(metrics_v.get('comprehensive_score', 0.0))
                         logger.info(
-                            f"🎯 視覺化評估 Eps={episodes_done_total} | Score={score_v:.3f} | "
+                            f"🎯 視覺化評估 Eps={episodes_done_total} | Score={score_v:.3f} (incl={metrics_v.get('comprehensive_score_incl_self', score_v):.3f}, excl={metrics_v.get('comprehensive_score_excl_self', score_v):.3f}, use_self={metrics_v.get('comprehensive_uses_self_play', False)}) | "
                             f"self={metrics_v.get('self_play', 0):.3f} minimax={metrics_v.get('vs_minimax', 0):.3f} rand={metrics_v.get('vs_random', 0):.3f}"
                         )
                     except Exception as ee:
@@ -1949,6 +2586,8 @@ class ConnectXTrainer:
                         self.visualize_training_game(episodes_done_total, save_dir='videos', opponent='tactical', fps=2)
                     except Exception as ve:
                         logger.warning(f"可視覺化失敗：{ve}")
+                    # 更新下一次視覺化門檻
+                    next_viz_at += visualize_every
 
         finally:
             try:
@@ -1980,6 +2619,51 @@ class ConnectXTrainer:
         logger.info(f"evaluate_self_play_player2_focus: {wins}/{total_games} wins, win_rate={win_rate:.3f}")
         return win_rate
 
+    def evaluate_ppo_diagnostics(self, samples: int = 5):
+        """Quick PPO diagnostics: average entropy and value on random legal states.
+        Returns dict with avg_entropy and avg_value. Best-effort only; safe on CPU.
+        """
+        try:
+            import numpy as np
+            ent_list, val_list = [], []
+            self.agent.policy_net.eval()
+            # Create a few empty or near-empty states to probe policy/value
+            for _ in range(max(1, int(samples))):
+                # start from empty, optionally add a couple random moves
+                board = [0] * 42
+                moves = np.random.randint(0, 4)
+                mark = 1
+                for _m in range(moves):
+                    valid = [c for c in range(7) if board[c] == 0]
+                    if not valid:
+                        break
+                    c = int(np.random.choice(valid))
+                    # drop piece
+                    grid = flat_to_2d(board)
+                    r = find_drop_row(grid, c)
+                    if r is None:
+                        continue
+                    grid[r][c] = mark
+                    board = [grid[i][j] for i in range(6) for j in range(7)]
+                    mark = 3 - mark
+
+                # Evaluate on current mark's perspective
+                state = self.agent.encode_state(board, mark)
+                valid = self.agent.get_valid_actions(board)
+                info = self.agent.get_action_scores(state, valid)
+                if info is None:
+                    continue
+                ent_list.append(float(info.get('entropy', 0.0)))
+                val_list.append(float(info.get('value', 0.0)))
+            if not ent_list:
+                return {'avg_entropy': None, 'avg_value': None}
+            return {
+                'avg_entropy': round(float(np.mean(ent_list)), 4),
+                'avg_value': round(float(np.mean(val_list)), 4),
+            }
+        except Exception:
+            return {'avg_entropy': None, 'avg_value': None}
+
     def evaluate_comprehensive(self, games: int = 50):
         try:
             vs_random = self.evaluate_against_random(games)
@@ -2004,18 +2688,34 @@ class ConnectXTrainer:
             self_play = 0.0
             
         # 權重（若配置有提供）
-        weights = self.config.get('evaluation', {}).get('weights', {})
+        eval_cfg = self.config.get('evaluation', {}) if isinstance(self.config, dict) else {}
+        weights = eval_cfg.get('weights', {}) if isinstance(eval_cfg, dict) else {}
         w_self = float(weights.get('self_play', 0.4))
         w_minimax = float(weights.get('vs_minimax', 0.4))
         w_random = float(weights.get('vs_random', 0.2))
-        total_w = max(1e-6, w_self + w_minimax + w_random)
-        comprehensive = (w_self * self_play + w_minimax * vs_minimax + w_random * vs_random) / total_w
+
+        # 是否在綜合評分中計入自對弈（預設：不計入，避免被 ≈50% 拉高或掩蓋）
+        include_self_in_score = bool(eval_cfg.get('count_self_play_in_score', False))
+
+        # 分別計算「包含自對弈」與「排除自對弈」兩種分數
+        total_w_incl = max(1e-6, w_self + w_minimax + w_random)
+        score_incl_self = (w_self * self_play + w_minimax * vs_minimax + w_random * vs_random) / total_w_incl
+
+        # 排除自對弈：自對弈權重視為 0，並重新正規化
+        total_w_excl = max(1e-6, (0.0) + w_minimax + w_random)
+        score_excl_self = (w_minimax * vs_minimax + w_random * vs_random) / total_w_excl
+
+        # 最終輸出遵循配置
+        comprehensive = score_incl_self if include_self_in_score else score_excl_self
         
         return {
             'vs_random': vs_random,
             'vs_minimax': vs_minimax,
             'self_play': self_play,
             'comprehensive_score': comprehensive,
+            'comprehensive_score_incl_self': score_incl_self,
+            'comprehensive_score_excl_self': score_excl_self,
+            'comprehensive_uses_self_play': include_self_in_score,
         }
 
     # --- Stagnation detection / handling ---
@@ -2249,8 +2949,8 @@ class ConnectXTrainer:
         num_workers = int(cfg_t.get('num_workers', max(1, (mp.cpu_count() or 2) - 1)))
         episodes_per_update = int(cfg_t.get('episodes_per_update', 16))
         max_episodes = int(cfg_t.get('max_episodes', 100000))
-        eval_frequency = int(cfg_t.get('eval_frequency', 200))
-        eval_games = int(cfg_t.get('eval_games', 30))
+        eval_frequency = int(self.config.get('evaluation', {}).get('frequency', 200))
+        eval_games = int(self.config.get('evaluation', {}).get('games', 30))
         win_scale = float(cfg_t.get('win_reward_scaling', 1.0))
         loss_scale = float(cfg_t.get('loss_penalty_scaling', 1.0))
         danger_scale = float(self.config.get('agent', {}).get('tactical_bonus', 0.1))
@@ -2273,6 +2973,7 @@ class ConnectXTrainer:
 
         rng = random.Random()
         best_score = -1.0
+        best_win_rate = -1.0
         episodes_done_total = len(self.episode_rewards)
         current_win_rate = 0.0  # 追蹤當前勝率
 
@@ -2347,19 +3048,19 @@ class ConnectXTrainer:
                                 current_win_rate = sum(recent_results) / len(recent_results)
                             
                             ep_reward_sum = 0.0
-                            last_idx = len(transitions) - 1
                             for idx, tr in enumerate(transitions):
                                 state = tr['state']
                                 action = int(tr['action'])
                                 prob = float(tr['prob'])
-                                reward = 0.0
-                                if idx == last_idx:
-                                    reward += (1.0 * win_scale) if player_result == 1 else (
-                                            -1.0 * loss_scale if player_result == -1 else 0.0)
+                                # 使用計算好的最終獎勵（包含自定義獎勵）
+                                reward = tr.get('reward', 0.0)
+                                
+                                # 如果需要額外的危險行為懲罰，可以添加
                                 if tr.get('is_dangerous', False):
                                     reward += -10.0 * danger_scale
+                                    
                                 ep_reward_sum += reward
-                                done = (idx == last_idx)
+                                done = (idx == len(transitions) - 1)
                                 self.agent.store_transition(state, action, prob, reward, done)
                                 steps_since_update += 1
                             self.episode_rewards.append(ep_reward_sum)
@@ -2378,7 +3079,8 @@ class ConnectXTrainer:
                         # 週期性評估
                         if eval_frequency > 0 and episodes_done_total % eval_frequency == 0:
                             metrics = self.evaluate_comprehensive(games=eval_games)
-                            score = float(metrics.get('comprehensive_score', 0.0))
+                            score = float(metrics.get('comprehensive_score'))
+
                             self.win_rates.append(score)
                             try:
                                 self.agent.scheduler.step(score)
@@ -2407,30 +3109,52 @@ class ConnectXTrainer:
                                     self._handle_convergence_stagnation(episodes_done_total)
                             except Exception:
                                 pass
+                        
                             if score > best_score:
                                 best_score = score
+                                send_telegram(f"🎉 新最佳分數 Eps={episodes_done_total} | Score={best_score:.3f} | ")
                                 self.save_checkpoint(f"best_model_wr_{best_score:.3f}.pt")
-
-                        if visualize_every > 0 and episodes_done_total % visualize_every == 0:
-                            try:
-                                quick_games = max(5, int(eval_games // 2))
-                                metrics_v = self.evaluate_comprehensive(games=quick_games)
-                                score_v = float(metrics_v.get('comprehensive_score', 0.0))
-                                logger.info(
-                                    f"🎯 視覺化評估 Eps={episodes_done_total} | Score={score_v:.3f} | "
-                                    f"self={metrics_v.get('self_play', 0):.3f} minimax={metrics_v.get('vs_minimax', 0):.3f} rand={metrics_v.get('vs_random', 0):.3f}"
-                                )
-                            except Exception as ee:
-                                logger.warning(f"視覺化前評估失敗：{ee}")
-                            try:
-                                self.visualize_training_game(episodes_done_total, save_dir='videos', opponent='tactical', fps=2)
-                            except Exception as ve:
-                                logger.warning(f"可視覺化失敗：{ve}")
-
-                        continue
-
-                    else:
-                        i += 1
+                            elif current_win_rate > best_win_rate:
+                                best_win_rate = current_win_rate
+                                send_telegram(f"🎉 新最佳we Eps={episodes_done_total} | Score={current_win_rate:.3f} | ")
+                                self.save_checkpoint(f"best_model_we_{current_win_rate:.3f}.pt")
+                            # 視覺化 (定期) ：快速評估 + 產生影片
+                            if visualize_every > 0 and episodes_done_total > 0 and episodes_done_total % visualize_every == 0:
+                                try:
+                                    quick_games = max(5, int(eval_games // 2))
+                                    metrics_v = self.evaluate_comprehensive(games=quick_games)
+                                    score_v = float(metrics_v.get('comprehensive_score', 0.0))
+                                    logger.info(
+                                        f"🎯 視覺化評估 Eps={episodes_done_total} | Score={score_v:.3f} | "
+                                        f"self={metrics_v.get('self_play', 0):.3f} minimax={metrics_v.get('vs_minimax', 0):.3f} rand={metrics_v.get('vs_random', 0):.3f}"
+                                    )
+                                except Exception as ee:
+                                    logger.warning(f"視覺化前快速評估失敗：{ee}")
+                                # 生成訓練對局影片
+                                try:
+                                    self.visualize_training_game(
+                                        episodes_done_total,
+                                        save_dir='videos',
+                                        opponent='tactical',
+                                        fps=2
+                                    )
+                                except Exception as ve:
+                                    logger.warning(f"可視覺化失敗：{ve}")
+                
+                try:
+                    quick_games = max(5, int(eval_games // 2))
+                    metrics_v = self.evaluate_comprehensive(games=quick_games)
+                    score_v = float(metrics_v.get('comprehensive_score', 0.0))
+                    logger.info(
+                        f"🎯 視覺化評估 Eps={episodes_done_total} | Score={score_v:.3f} | "
+                        f"self={metrics_v.get('self_play', 0):.3f} minimax={metrics_v.get('vs_minimax', 0):.3f} rand={metrics_v.get('vs_random', 0):.3f}"
+                    )
+                except Exception as ee:
+                    logger.warning(f"視覺化前評估失敗：{ee}")
+                try:
+                    self.visualize_training_game(episodes_done_total, save_dir='videos', opponent='tactical', fps=2)
+                except Exception as ve:
+                    logger.warning(f"可視覺化失敗：{ve}")
 
                 # 補足 in_flight
                 while len(in_flight) < target_inflight:
@@ -2598,6 +3322,24 @@ class ConnectXTrainer:
         if out_path:
             logger.info(f"🎬 已輸出訓練對局影片: {out_path}")
         return out_path
+
+def send_telegram(msg: str):
+    token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID") or "6166024220"
+    if not token or not chat_id:
+        logger.info("未設置 TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID，略過訊息通知。")
+        return
+    try:
+        import requests
+        base = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {"chat_id": chat_id, "text": msg}
+        r = requests.post(base, data=payload, timeout=3.0)
+        logger.info("已發送 Telegram 通知。")
+    except Exception as e:
+        logger.warning(f"Telegram 發送失敗: {e}")
+
+
+
 def main():
     """Main entry: load config, resume from latest checkpoint, train, notify."""
     # Local imports to keep global scope clean
@@ -2629,13 +3371,44 @@ def main():
             ts = parse_ts_from_name(fname)
             try:
                 t = ts.timestamp() if ts is not None else os.path.getmtime(p)
-
             except OSError:
                 t = 0
             if latest is None or t > latest_time:
                 latest = p
                 latest_time = t
         return latest
+
+    # --- 新增：挑選 best_model_wr_X.pt 中 win rate 最高者 ---
+    def choose_best_wr_checkpoint(files):
+        """在檔名中尋找 best_model_wr_*.pt，取 win rate 最大者，並驗證可讀取。
+        例如: best_model_wr_0.393.pt > best_model_wr_0.380.pt
+        若讀取失敗則跳過，全部失敗回傳 None。"""
+        import re as _re
+        pattern = _re.compile(r"best_model_wr_(\d+(?:\.\d+)?)\.pt$")
+        # 收集 (wr, path)
+        candidates = []
+        for p in files:
+            m = pattern.search(os.path.basename(p))
+            if m:
+                try:
+                    wr = float(m.group(1))
+                    candidates.append((wr, p))
+                except ValueError:
+                    continue
+        if not candidates:
+            return None
+        # 依 win rate 由大到小排序
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        for wr, path in candidates:
+            try:
+                # 快速驗證檔案是否可被 torch.load（不必套用）
+                _ = torch.load(path, map_location='cpu')
+                logger.info(f"選擇最高勝率檢查點: {os.path.basename(path)} (wr={wr:.3f})")
+                return path
+            except Exception as e:
+                logger.warning(f"略過不可用勝率檢查點 {path}: {e}")
+                continue
+        return None
 
     def find_working_checkpoint(files):
         """回傳第一個可成功 torch.load 的檢查點（依時間新→舊）。若沒有則回傳 None。"""
@@ -2647,32 +3420,13 @@ def main():
                 return 0
         for p in sorted(files, key=_mtime, reverse=True):
             try:
-                # 先快速嘗試讀取，僅為驗證檔案結構，不需真正套用
                 _ = torch.load(p, map_location='cpu')
                 logger.info(f"檢查點可用：{p}")
                 return p
             except Exception as e:
                 logger.warning(f"略過不可用檢查點 {p}: {e}")
                 continue
-       
         return None
-
-    def send_telegram(msg: str):
-        token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
-        chat_id = os.getenv("TELEGRAM_CHAT_ID") or "6166024220"
-        if not token or not chat_id:
-            logger.info("未設置 TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID，略過訊息通知。")
-            return
-        try:
-            import requests
-            base = f"https://api.telegram.org/bot{token}/sendMessage"
-
-            payload = {"chat_id": chat_id, "text": msg}
-            r = requests.post(base, data=payload)
-            logger.info("已發送 Telegram 通知。")
-        except Exception as e:
-            logger.warning(f"Telegram 發送失敗: {e}")
-
     # --- choose config ---
     cfg_path = "config.yaml"
     if not os.path.exists(cfg_path):
@@ -2687,22 +3441,23 @@ def main():
     trainer = ConnectXTrainer(cfg_path)
 
     # --- resume from checkpoint ---
-    import glob
     resume_from_env = os.getenv("CHECKPOINT_PATH") or os.getenv("RESUME_FROM")
     ckpt_to_load = None
     if resume_from_env and os.path.exists(resume_from_env):
         ckpt_to_load = resume_from_env
     else:
         files = glob.glob(os.path.join('checkpoints', '*.pt'))
-       
-        # 優先選擇可成功被 torch.load 的最新檔，避免讀到半寫入壞檔
-        ckpt_to_load = find_working_checkpoint(files)
+        # 1) 先找最高勝率 best_model_wr_*.pt
+        ckpt_to_load = choose_best_wr_checkpoint(files)
         if ckpt_to_load is None:
-            # 退而求其次選名稱/mtime 最新者
-            ckpt_to_load = choose_latest_checkpoint_by_name(files)
+            # 2) 再找可用 (時間新→舊) 檢查點
+            ckpt_to_load = find_working_checkpoint(files)
+            if ckpt_to_load is None:
+                # 3) 退回原本依名稱/mtime 的最新者
+                ckpt_to_load = choose_latest_checkpoint_by_name(files)
 
     logger.info(f"ckpt_to_load: {ckpt_to_load}")
-    send_telegram("使用: "+ckpt_to_load +" model來繼續")
+    send_telegram("使用: "+str(ckpt_to_load)+" model來繼續")
     if ckpt_to_load:
         loaded = trainer.load_checkpoint(ckpt_to_load)
         if not loaded:
@@ -2729,13 +3484,6 @@ def main():
         logger.error(f"訓練過程發生錯誤: {e}\n{traceback.format_exc()}")
     finally:
         pass
-        # 儲存最後檢查點
-        # ts_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # try:
-            # trainer.save_checkpoint(f"final_{ts_tag}.pt")
-        # except Exception as se:
-            # logger.warning(f"保存最終檢查點失敗: {se}")
-
     # --- notify ---
 
     elapsed = datetime.now() - start_ts

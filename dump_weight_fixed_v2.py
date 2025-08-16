@@ -376,7 +376,7 @@ def find_safe_action(board, mark, preferred_action, max_attempts=7):
 
 # -------------- Agent main --------------
 
-def my_agent(obs, config):
+def agent(obs, config):
     board = obs['board']; mark = obs['mark']
     win = immediate_win(board, mark)
     if win != -1:
@@ -567,7 +567,7 @@ def find_safe_action(board, mark, preferred_action, max_attempts=7):
         return preferred_action
     return random.choice(valids) if valids else 0
 
-def my_agent(obs, config):
+def agent(obs, config):
     board = obs['board']; mark = obs['mark']
     win = immediate_win(board, mark)
     if win != -1:
