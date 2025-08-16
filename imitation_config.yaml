@@ -1,0 +1,23 @@
+# Connect4 模仿學習配置文件
+
+model:
+  input_size: 126        # 3 channels * 6 rows * 7 cols = 126
+  hidden_size: 2000       # 隱藏層大小，與訓練腳本一致
+  num_layers: 32        # 網路深度，與訓練腳本一致
+
+training:
+  learning_rate: 0.001   # 學習率
+  weight_decay: 0.0001   # 權重衰減
+  num_samples: 20000     # 訓練樣本數量
+  num_epochs: 100        # 訓練輪數
+  batch_size: 128        # 批次大小
+  val_split: 0.1         # 驗證集比例
+
+paths:
+  input_model: null      # 可選：載入現有模型路徑 (例如: "existing_model.pt")
+  output_model: "imitation_pretrained_model.pt"  # 輸出模型路徑
+
+c4solver:
+  path: "./c4solver"     # C4Solver可執行檔路徑
+  timeout: 5.0           # 求解超時時間(秒)
+  max_depth: 20          # 最大搜索深度
