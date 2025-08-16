@@ -1,128 +1,129 @@
-# ConnectX 可视化指南
+# ConnectX 可視化功能使用指南
 
-## 问题解决方案
+## 功能概述
 
-### 1. 中文字体缺失警告
-**问题**: matplotlib显示中文时出现字体缺失警告
-**解决方案**: 
-- 已将所有可视化文本改为英文
-- 添加了字体配置，使用系统可用字体
+我們已經為 ConnectX RL 訓練系統添加了遊戲可視化功能，可以在訓練過程中每 100 個回合自動展示 AI 對戰不同對手的畫面。
 
-### 2. 目录不存在错误  
-**问题**: 保存文件时目录不存在
-**解决方案**:
-- 自动创建必要的目录（game_visualizations, game_videos）
-- 增加了错误处理
+## 新增功能
 
-## 可视化选项
+### 1. 自動可視化
+- **觸發頻率**: 每 100 個訓練回合
+- **對手類型**: 根據訓練進度自動選擇
+  - 回合 0-2999: 對戰隨機對手 (Random Agent)
+  - 回合 3000-4999: 對戰自己 (Self-Play)
+  - 回合 5000+: 對戰 Minimax 對手
 
-### 1. Text Visualization (推荐)
-```python
-# 在配置文件中设置
-visualization:
-  type: "text"
-```
-- **优点**: 无字体问题，快速，资源占用少
-- **缺点**: 只显示最终状态和移动历史
-- **适用**: 快速调试，服务器环境
-
-### 2. Matplotlib Visualization  
-```python
-visualization:
-  type: "matplotlib"
-```
-- **优点**: 静态图片，显示多个游戏状态
-- **缺点**: 可能有字体问题，需要GUI环境
-- **适用**: 详细分析，报告生成
-
-### 3. Video Visualization
-```python
-visualization:
-  type: "video"
-```
-- **优点**: 动态显示整个游戏过程
-- **缺点**: 需要opencv，文件较大
-- **适用**: 演示，详细观察策略
-
-### 4. All (全部)
-```python
-visualization:
-  type: "all"
-```
-- 同时生成文本、图片和视频
-- 适用于完整记录
+### 2. 可視化內容
+- **遊戲棋盤**: 實時顯示 6×7 連線棋盤狀態
+- **棋子標記**: 紅色圓圈代表玩家 1，藍色圓圈代表玩家 2
+- **對手信息**: 清楚標註當前對戰的對手類型
+- **遊戲歷程**: 顯示每一步的棋盤變化
 
 ## 使用方法
 
-### 配置文件设置 (config.yaml)
-```yaml
-# 添加可视化配置
-visualization:
-  type: "text"  # 选择: "text", "matplotlib", "video", "all"
-  
-# 其他现有配置...
-training:
-  num_episodes: 100000
-  # ...
-```
-
-### 手动调用
-```python
-trainer = ConnectXTrainer("config.yaml")
-
-# 文本可视化（推荐，无字体问题）
-trainer.demo_game_with_visualization(episode_num=100, visualization_type="text")
-
-# 视频可视化
-trainer.demo_game_with_visualization(episode_num=100, visualization_type="video")
-
-# 所有类型
-trainer.demo_game_with_visualization(episode_num=100, visualization_type="all")
-```
-
-## 输出文件位置
-
-- **文本输出**: 直接显示在控制台
-- **图片文件**: `game_visualizations/episode_XXX_AgentA_vs_AgentB_timestamp.png`
-- **视频文件**: `game_videos/episode_XXX_AgentA_vs_AgentB_timestamp.mp4`
-
-## 推荐设置
-
-### 服务器环境 (无GUI)
-```yaml
-visualization:
-  type: "text"
-```
-
-### 本地开发环境
-```yaml
-visualization:
-  type: "video"  # 或 "all"
-```
-
-### 调试模式
-```yaml
-visualization:
-  type: "text"  # 快速，无额外依赖
-```
-
-## 依赖安装
+### 自動可視化（推薦）
+直接運行訓練腳本，系統會自動在每 100 回合時展示可視化：
 
 ```bash
-# matplotlib可视化 (可选)
-pip install matplotlib
-
-# 视频可视化 (可选)  
-pip install opencv-python
-
-# 文本可视化无需额外依赖
+python train_connectx_rl_robust.py
 ```
+
+訓練日誌會顯示：
+```
+第 100 回合：展示對戰 random 對手
+第 200 回合：展示對戰 random 對手
+第 3000 回合：展示對戰 self_play 對手
+第 5000 回合：展示對戰 minimax 對手
+```
+
+### 手動測試可視化
+使用測試腳本驗證可視化功能：
+
+```bash
+python test_visualization.py
+```
+
+### 自定義可視化
+您也可以在代碼中手動調用可視化功能：
+
+```python
+from train_connectx_rl_robust import ConnectXTrainer
+
+# 創建訓練器
+trainer = ConnectXTrainer(config)
+
+# 手動展示對戰特定對手
+trainer.demo_game_with_visualization("random")    # 對戰隨機對手
+trainer.demo_game_with_visualization("self_play") # 自我對戰
+trainer.demo_game_with_visualization("minimax")   # 對戰 Minimax
+```
+
+## 技術細節
+
+### 依賴要求
+- `matplotlib`: 用於遊戲棋盤可視化
+- `numpy`: 數值計算
+- `kaggle-environments`: ConnectX 遊戲環境
+
+### 可視化組件
+1. **visualize_game()**: 核心可視化方法，展示完整遊戲過程
+2. **demo_game_with_visualization()**: 便捷方法，根據對手類型自動設置
+3. **VISUALIZATION_AVAILABLE**: 自動檢測 matplotlib 是否可用
+
+### 錯誤處理
+- 如果 matplotlib 不可用，系統會跳過可視化但繼續訓練
+- 可視化過程中的錯誤會記錄日誌但不影響主訓練流程
+- 每次可視化都有異常捕獲機制
+
+## 訓練階段說明
+
+### 階段一：基礎學習 (0-2999 回合)
+- **對手**: 隨機對手
+- **目標**: 學習基本的遊戲規則和連線策略
+- **可視化**: 展示 AI 如何從隨機行為學習到有意識的走棋
+
+### 階段二：自我提升 (3000-4999 回合)
+- **對手**: 自我對戰
+- **目標**: 通過與自己對戰來發現更複雜的策略
+- **可視化**: 展示兩個相同 AI 之間的高質量對局
+
+### 階段三：挑戰高手 (5000+ 回合)
+- **對手**: Minimax 對手
+- **目標**: 對抗傳統的 AI 算法來測試策略深度
+- **可視化**: 展示 RL 對戰傳統演算法的精彩對局
+
+## 日誌信息
+
+可視化功能會在訓練日誌中提供以下信息：
+- 回合數和對手類型
+- 可視化成功/失敗狀態
+- 遊戲結果（勝負）
+- 任何錯誤或警告信息
 
 ## 故障排除
 
-1. **字体警告**: 使用 `type: "text"` 避免
-2. **目录错误**: 已自动解决，会自动创建目录
-3. **OpenCV错误**: 安装 `pip install opencv-python`
-4. **显示问题**: 在服务器上使用 `type: "text"`
+### 常見問題
+1. **matplotlib 未安裝**: 安裝 `pip install matplotlib`
+2. **顯示器問題**: 在無頭環境中可能無法顯示，但不影響訓練
+3. **內存使用**: 可視化會略微增加內存使用，但在合理範圍內
 
-现在训练将使用文本可视化作为默认选项，避免字体问题！
+### 禁用可視化
+如果需要禁用可視化功能，可以設置環境變量：
+```bash
+export DISABLE_VISUALIZATION=1
+python train_connectx_rl_robust.py
+```
+
+## 性能影響
+
+- **訓練速度**: 可視化只在每 100 回合觸發，對整體訓練速度影響極小
+- **內存使用**: 每次可視化會創建臨時圖形對象，使用後自動釋放
+- **磁盤空間**: 不會自動保存圖片，如需保存可手動修改代碼
+
+## 未來擴展
+
+計劃中的改進包括：
+- 保存可視化動畫為 GIF 或視頻文件
+- 添加更多統計信息展示
+- 支持自定義可視化頻率
+- 添加勝率趨勢圖表

@@ -1050,6 +1050,11 @@ class PPOAgent:
             num_layers=config['num_layers']
         ).to(self.device)
 
+        # 載入預訓練模型 (如果指定)
+        pretrained_path = config.get('pretrained_model_path')
+        if pretrained_path:
+            self.load_pretrained_model(pretrained_path)
+
         # 優化器
         self.optimizer = optim.Adam(
             self.policy_net.parameters(),
@@ -1088,6 +1093,43 @@ class PPOAgent:
         self.last_partial_reset_update = -10**9
         # Ensure numpy alias
         self._np = np
+
+    def load_pretrained_model(self, model_path: str):
+        """
+        載入預訓練的模仿學習模型
+        
+        Args:
+            model_path: 模型檔案路徑
+        """
+        if not os.path.exists(model_path):
+            logger.warning(f"預訓練模型不存在: {model_path}")
+            return False
+        
+        try:
+            # 載入模型
+            checkpoint = torch.load(model_path, map_location=self.device)
+            
+            if 'model_state_dict' in checkpoint:
+                # 完整的checkpoint格式
+                model_state = checkpoint['model_state_dict']
+                epoch = checkpoint.get('epoch', 0)
+                loss = checkpoint.get('loss', 0.0)
+                logger.info(f"載入預訓練模型: {model_path} (epoch={epoch}, loss={loss:.4f})")
+            else:
+                # 僅模型狀態格式
+                model_state = checkpoint
+                logger.info(f"載入預訓練模型狀態: {model_path}")
+            
+            # 載入權重
+            self.policy_net.load_state_dict(model_state)
+            
+            logger.info("✅ 成功載入預訓練模型！模型已準備好進行RL訓練")
+            return True
+            
+        except Exception as e:
+            logger.error(f"載入預訓練模型失敗: {e}")
+            logger.info("將使用隨機初始化的模型繼續訓練")
+            return False
 
     # === Kaggle env helpers used by trainer ===
     def extract_board_and_mark(self, env_state, player_idx):
