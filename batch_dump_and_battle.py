@@ -62,12 +62,14 @@ def dump_all_checkpoints(ckpt_dir: str = CHECKPOINT_DIR, sub_dir: str = SUB_DIR)
                         continue
                 except Exception as e:
                     try:
-                        subprocess.run(cmd, check=True, shell=True)
+                        print(f"  Running: {' '.join(cmd)}")
+                        os.system(' '.join(cmd))
                     except Exception as e:
                         print(f"  ⚠️  battle dumper failed for {base_name}, falling back: {e}")
             else:
                 try:
-                    subprocess.run(cmd, check=True, shell=True)
+                    print(f"  Running: {' '.join(cmd)}")
+                    os.system(' '.join(cmd))
                 except Exception as e:
                     try:
                         produced = battle_dumper.dump_checkpoint_to_submission(Path(pt_path), dry_run=False)

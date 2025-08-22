@@ -42,7 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from train_connectx_rl_robust import ConnectXNet, flat_to_2d, is_win_from, find_drop_row, send_telegram
 from batch_dump_and_battle import load_agent_from_submission, evaluate_pair, dump_all_checkpoints, load_state_np, write_submission_from_np_state
 # Import our ResNet extractor
-from policies.resnet_features import ResNetExtractor
+from policies.transformer_features import TransformerExtractor
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -600,6 +600,10 @@ def train_against_opponents(main_ckpt: str, failed_opponents: List[Tuple[str, st
     device = torch.device("cpu")
     
     # Initialize PPO with loaded weights
+    # Extremely large Transformer-based policy/value networks.
+    # NOTE: This configuration is memory intensive (hundreds of millions of params).
+    # Adjust n_layers or d_model if you encounter OOM.
+    big_layers = [512] * 24  # 32-layer 2000-d hidden for both policy (pi) and value (vf) MLP heads
     model = PPO(
         "MlpPolicy",
         env,
@@ -613,15 +617,21 @@ def train_against_opponents(main_ckpt: str, failed_opponents: List[Tuple[str, st
         ent_coef=config.ent_coef,
         vf_coef=config.vf_coef,
         max_grad_norm=config.max_grad_norm,
-        # Use a feature extractor (ResNet) and small MLP heads; depth configurable via ResNetExtractor
         policy_kwargs=dict(
-            features_extractor_class=ResNetExtractor,
-            features_extractor_kwargs={"channels": 64, "num_blocks": 12, "feat_dim": 1024},
-            net_arch=dict(pi=[512], vf=[512]),
-            activation_fn=torch.nn.ReLU
+            features_extractor_class=TransformerExtractor,
+            features_extractor_kwargs={
+                "d_model": 512,
+                "n_layers": 24,
+                "n_heads": 32,
+                "ff_multiplier": 4,
+                "dropout": 0.0,
+                "use_cls": True,
+            },
+            net_arch=dict(pi=big_layers, vf=big_layers),
+            activation_fn=torch.nn.GELU,
         ),
         device=device,
-        verbose=1
+        verbose=1,
     )
     
     # Load pretrained weights
