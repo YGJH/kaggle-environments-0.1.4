@@ -19,7 +19,7 @@ def check_requirements():
     logger.info("🔍 檢查系統要求...")
     
     # 檢查C4Solver
-    if not os.path.exists('./c4solver'):
+    if not os.path.exists('connect4/c4solver'):
         logger.error("❌ 找不到 c4solver 可執行檔")
         logger.info("請確保 c4solver 在當前目錄下且可執行")
         return False

@@ -8,7 +8,7 @@ model:
 training:
   learning_rate: 0.001   # 學習率
   weight_decay: 0.0001   # 權重衰減
-  num_samples: 20000     # 訓練樣本數量
+  num_samples: 200     # 訓練樣本數量
   num_epochs: 100        # 訓練輪數
   batch_size: 128        # 批次大小
   val_split: 0.1         # 驗證集比例
@@ -18,6 +18,6 @@ paths:
   output_model: "imitation_pretrained_model.pt"  # 輸出模型路徑
 
 c4solver:
-  path: "./c4solver"     # C4Solver可執行檔路徑
+  path: "./connect4/c4solver"     # C4Solver可執行檔路徑
   timeout: 5.0           # 求解超時時間(秒)
   max_depth: 20          # 最大搜索深度

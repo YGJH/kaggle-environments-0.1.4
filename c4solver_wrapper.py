@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Connect4 C++ Solver Python包裝器
+Connect4 C++ Solver Python包裝器 - 修復版本
 """
 
 import subprocess
 import os
 import time
 import logging
+import random
 from typing import List, Tuple, Optional, Dict
 import numpy as np
 
@@ -19,7 +20,7 @@ class C4SolverError(Exception):
 class C4SolverWrapper:
     """Connect4 C++ Solver Python包裝器"""
     
-    def __init__(self, solver_path: str = "./c4solver", timeout: float = 5.0):
+    def __init__(self, solver_path: str = "connect4/c4solver", timeout: float = 5.0):
         """
         初始化C4Solver包裝器
         
@@ -46,8 +47,8 @@ class C4SolverWrapper:
         try:
             # 測試簡單局面
             result = subprocess.run(
-                [self.solver_path],
-                input="4\n",
+                [self.solver_path, '-a'],
+                input="\n",  # 空序列測試
                 text=True,
                 capture_output=True,
                 timeout=2.0
@@ -115,15 +116,6 @@ class C4SolverWrapper:
                 'valid': bool          # 是否為有效局面
             }
         """
-        if not move_sequence:
-            return {
-                'score': 0,
-                'scores': [0] * 7,
-                'move_sequence': move_sequence,
-                'solve_time': 0.0,
-                'valid': False
-            }
-        
         # 構建命令參數
         cmd = [self.solver_path]
         if weak:
@@ -155,8 +147,14 @@ class C4SolverWrapper:
                     'valid': False
                 }
             
-            # 解析輸出
-            output_line = result.stdout.strip()
+            # 解析輸出 - 跳過 "Loading opening book" 行
+            output_lines = result.stdout.strip().split('\n')
+            output_line = None
+            for line in output_lines:
+                if not line.startswith('Loading') and line.strip():
+                    output_line = line.strip()
+                    break
+            
             if not output_line:
                 return {
                     'score': 0,
@@ -167,24 +165,24 @@ class C4SolverWrapper:
                 }
             
             parts = output_line.split()
-            if len(parts) < 2:
-                return {
-                    'score': 0,
-                    'scores': [0] * 7,
-                    'move_sequence': move_sequence,
-                    'solve_time': solve_time,
-                    'valid': False
-                }
             
             if analyze:
-                # 分析模式：返回所有動作的評分
-                if len(parts) >= 8:  # move_sequence + 7個評分
+                # 分析模式：期望格式 "序列 分數1 分數2 ... 分數7"
+                # 對於空序列，格式為 " 分數1 分數2 ... 分數7"
+                if len(parts) >= 7:  # 至少7個評分
                     scores = []
-                    for i in range(1, 8):
+                    # 如果第一個部分是序列或空白，從適當位置開始解析
+                    start_idx = 1 if (len(parts) > 7 or (parts[0] == move_sequence and move_sequence)) else 0
+                    
+                    for i in range(start_idx, start_idx + 7):
                         try:
-                            scores.append(int(parts[i]))
+                            if i < len(parts):
+                                scores.append(int(parts[i]))
+                            else:
+                                scores.append(0)
                         except (ValueError, IndexError):
                             scores.append(0)
+                    
                     return {
                         'score': max(scores) if scores else 0,
                         'scores': scores,
@@ -194,17 +192,18 @@ class C4SolverWrapper:
                     }
             else:
                 # 標準模式：返回局面評分
-                try:
-                    score = int(parts[1])
-                    return {
-                        'score': score,
-                        'scores': [score] + [0] * 6,  # 填充為7個元素
-                        'move_sequence': move_sequence,
-                        'solve_time': solve_time,
-                        'valid': True
-                    }
-                except ValueError:
-                    pass
+                if len(parts) >= 2:
+                    try:
+                        score = int(parts[1])
+                        return {
+                            'score': score,
+                            'scores': [score] * 7,  # 為了一致性
+                            'move_sequence': move_sequence,
+                            'solve_time': solve_time,
+                            'valid': True
+                        }
+                    except ValueError:
+                        pass
             
             return {
                 'score': 0,
@@ -262,11 +261,11 @@ class C4SolverWrapper:
             result = self.evaluate_board(board, analyze=True)
             
             if not result['valid'] or len(result['scores']) != 7:
-                # Fallback to center preference
+                # Fallback策略
                 center_preference = [3, 4, 2, 5, 1, 6, 0]
                 for col in center_preference:
                     if col in valid_actions:
-                        return col, 0.0
+                        return col, 0.1
                 return valid_actions[0] if valid_actions else 0, 0.0
             
             # 找出有效動作中的最佳評分
@@ -274,19 +273,18 @@ class C4SolverWrapper:
             best_action = valid_actions[0] if valid_actions else 0
             
             for action in valid_actions:
-                if 0 <= action < 7:
+                if action < len(result['scores']):
                     score = result['scores'][action]
                     if score > best_score:
                         best_score = score
                         best_action = action
             
             # 計算信心分數(基於評分差異)
-            scores_array = np.array([result['scores'][a] for a in valid_actions])
+            scores_array = np.array([result['scores'][a] for a in valid_actions if a < len(result['scores'])])
             if len(scores_array) > 1:
-                confidence = (best_score - np.mean(scores_array)) / (np.std(scores_array) + 1e-6)
-                confidence = max(0.0, min(1.0, confidence / 10.0))  # 歸一化到0-1
+                confidence = min(1.0, abs(best_score - np.mean(scores_array)) / 10.0)
             else:
-                confidence = 1.0
+                confidence = 0.5
             
             return best_action, confidence
             
@@ -296,24 +294,24 @@ class C4SolverWrapper:
             center_preference = [3, 4, 2, 5, 1, 6, 0]
             for col in center_preference:
                 if col in valid_actions:
-                    return col, 0.0
+                    return col, 0.1
             return valid_actions[0] if valid_actions else 0, 0.0
 
 
 # 全局C4Solver實例
 _c4solver = None
 
-def get_c4solver() -> C4SolverWrapper:
+def get_c4solver() -> Optional[C4SolverWrapper]:
     """獲取全局C4Solver實例"""
     global _c4solver
     if _c4solver is None:
         try:
             # 嘗試不同的路徑
             possible_paths = [
-                "./c4solver",
+                "connect4/c4solver",
                 "./connect4/c4solver", 
                 "c4solver",
-                "connect4/c4solver"
+                "./c4solver"
             ]
             
             for path in possible_paths:
@@ -322,7 +320,7 @@ def get_c4solver() -> C4SolverWrapper:
                     break
             
             if _c4solver is None:
-                raise C4SolverError("C4Solver executable not found in any expected location")
+                logger.warning("C4Solver not found in any of the expected paths")
                 
         except Exception as e:
             logger.warning(f"C4Solver initialization failed: {e}")

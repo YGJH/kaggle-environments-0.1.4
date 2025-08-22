@@ -19,7 +19,7 @@ from typing import List, Dict, Tuple
 import time
 
 # 導入必要的組件
-from train_connectx_rl_robust import ConnectXNet, PPOAgent
+from train_connectx_rl_robust import ConnectXNet, PPOAgent, flat_to_2d, is_winning_move, find_drop_row, is_win_from
 from c4solver_wrapper import get_c4solver, C4SolverWrapper
 from kaggle_environments import make
 
@@ -175,11 +175,25 @@ class ImitationDataset:
                 board, current_player = self.generate_position()
                 
                 # 檢查遊戲是否已結束
-                env = make('connectx', debug=False)
-                env.state = [{'observation': {'board': board, 'mark': current_player}}, 
-                           {'observation': {'board': board, 'mark': 3-current_player}}]
+                # 檢查是否有獲勝情況
+                grid = flat_to_2d(board)
+                game_done = False
                 
-                if env.done:
+                # 檢查是否有連成四子
+                for r in range(6):
+                    for c in range(7):
+                        if board[r*7 + c] != 0:
+                            if is_win_from(grid, r, c, board[r*7 + c]):
+                                game_done = True
+                                break
+                    if game_done:
+                        break
+                
+                # 檢查是否棋盤已滿
+                if not game_done and all(board[i] != 0 for i in range(7)):
+                    game_done = True
+                
+                if game_done:
                     continue
                 
                 # 編碼狀態 (使用PPOAgent的編碼方式)
@@ -279,7 +293,6 @@ class ImitationLearner:
             mode='min',
             factor=0.8,
             patience=5,
-            verbose=True
         )
         
         # 訓練統計

@@ -378,12 +378,6 @@ def find_safe_action(board, mark, preferred_action, max_attempts=7):
 
 def agent(obs, config):
     board = obs['board']; mark = obs['mark']
-    win = immediate_win(board, mark)
-    if win != -1:
-        return int(win)
-    block = immediate_block(board, mark)
-    if block != -1:
-        return int(block)
     valids = get_valid_actions(board)
     if not valids:
         return 0
@@ -412,7 +406,7 @@ def agent(obs, config):
     return int(final_action)
 '''
     else:
-        # 簡單架構
+        # 簡單/通用架構：同時支援我們的舊簡單MLP命名與 SB3 MlpPolicy 命名
         code = '''import numpy as np
 import base64, io
 # Simple CNN architecture
@@ -423,6 +417,11 @@ def load_weights():
     data = np.load(buf)
     return {k: data[k] for k in data.files}
 weights = load_weights()
+
+# 檢測是否為 Stable-Baselines3 的 MlpPolicy 權重命名（更穩健）
+_HAS_POLICY_NET = any(k.startswith('mlp_extractor.policy_net.') and k.endswith('.weight') for k in weights.keys())
+_HAS_ACTION_HEAD = any(k.startswith('action_net') and (k.endswith('.weight') or k.endswith('.bias')) for k in weights.keys())
+_IS_SB3 = _HAS_POLICY_NET and _HAS_ACTION_HEAD
 
 # 戰術輔助函數（與高級版本相同）
 def get_valid_actions(board):
@@ -489,27 +488,70 @@ def linear(x, w, b):
     return x @ w.T + b
 
 def encode_state(board, mark):
-    # 簡單3平面編碼
+    """狀態編碼：
+    - 若為 SB3 MlpPolicy 權重，輸入為原始 42 維棋盤（與訓練一致）。
+    - 否則回退到舊簡單 3 平面編碼（126 維）。
+    """
+    if _IS_SB3:
+        return np.array(board, dtype=np.float32)
+    # fallback: 三平面
     arr = np.array(board).reshape(6,7)
+    # 由於無法得知訓練時的玩家標記約定，這裡沿用原簡單實作：用當前玩家/對手/空格三平面
     p = (arr == mark).astype(np.float32)
     o = (arr == (3-mark)).astype(np.float32)
     e = (arr == 0).astype(np.float32)
     return np.concatenate([p.ravel(), o.ravel(), e.ravel()])
 
 def forward_pass(state):
-    # 簡單MLP前向傳播
+    # 通用 MLP 前向傳播
     x = np.array(state, dtype=np.float32)
-    # 隱藏層
-    hidden_layers = sorted([k for k in weights.keys() if k.startswith('hidden')])
-    for layer_name in hidden_layers:
-        w = weights[layer_name + '.weight']
-        b = weights[layer_name + '.bias'] if layer_name + '.bias' in weights else np.zeros(w.shape[0])
-        x = relu(linear(x, w, b))
-    
-    # 輸出層
-    w_out = weights['output.weight']
-    b_out = weights['output.bias'] if 'output.bias' in weights else np.zeros(w_out.shape[0])
-    logits = linear(x, w_out, b_out)
+    if _IS_SB3:
+        # 依序套用 policy_net.* 層（線性 + ReLU），然後 action_net 輸出
+        # key 格式: 'mlp_extractor.policy_net.{idx}.weight'
+        idxs = []
+        for k in weights.keys():
+            if k.startswith('mlp_extractor.policy_net.') and k.endswith('.weight'):
+                parts = k.split('.')
+                # parts: ['mlp_extractor','policy_net','{idx}','weight']
+                if len(parts) >= 4:
+                    try:
+                        idxs.append(int(parts[2]))
+                    except Exception:
+                        pass
+        idxs = sorted(set(idxs))
+        for i in idxs:
+            w = weights[f'mlp_extractor.policy_net.{i}.weight']
+            b_key = f'mlp_extractor.policy_net.{i}.bias'
+            b = weights[b_key] if b_key in weights else np.zeros(w.shape[0], dtype=np.float32)
+            x = relu(linear(x, w, b))
+        # 輸出層（動作 logits）
+        # 某些版本可能使用 'action_net.0.weight' 形式；做回退搜尋
+        if 'action_net.weight' in weights:
+            w_out = weights['action_net.weight']
+            b_out = weights['action_net.bias'] if 'action_net.bias' in weights else np.zeros(w_out.shape[0], dtype=np.float32)
+        else:
+            # 找到第一個 action_net.*.weight
+            cand_w = sorted([k for k in weights.keys() if k.startswith('action_net') and k.endswith('.weight')])
+            if not cand_w:
+                raise KeyError('action head weight not found')
+            w_key = cand_w[0]
+            b_key = w_key[:-6] + 'bias'  # replace '.weight' -> '.bias'
+            w_out = weights[w_key]
+            b_out = weights[b_key] if b_key in weights else np.zeros(w_out.shape[0], dtype=np.float32)
+        logits = linear(x, w_out, b_out)
+    else:
+        # 舊簡單命名：hidden*.{weight,bias} + output.{weight,bias}
+        hidden_layers = sorted([k for k in weights.keys() if k.startswith('hidden') and k.endswith('.weight')])
+        # 只取層名，不含後綴
+        hidden_bases = [h[:-7] for h in hidden_layers]  # 去掉 '.weight'
+        for base in hidden_bases:
+            w = weights[base + '.weight']
+            b_key = base + '.bias'
+            b = weights[b_key] if b_key in weights else np.zeros(w.shape[0], dtype=np.float32)
+            x = relu(linear(x, w, b))
+        w_out = weights['output.weight']
+        b_out = weights['output.bias'] if 'output.bias' in weights else np.zeros(w_out.shape[0], dtype=np.float32)
+        logits = linear(x, w_out, b_out)
     
     # Softmax
     exp = np.exp(logits - np.max(logits))
@@ -569,12 +611,6 @@ def find_safe_action(board, mark, preferred_action, max_attempts=7):
 
 def agent(obs, config):
     board = obs['board']; mark = obs['mark']
-    win = immediate_win(board, mark)
-    if win != -1:
-        return int(win)
-    block = immediate_block(board, mark)
-    if block != -1:
-        return int(block)
     valids = get_valid_actions(board)
     if not valids:
         return 0
@@ -669,18 +705,55 @@ if __name__ == "__main__":
         sys.exit(1)
    
     # 只保留張量權重並轉為 numpy
-    np_state = {}
+    raw_np_state = {}
     for k, v in state_dict.items():
         try:
             if isinstance(v, torch.Tensor):
-                np_state[k] = v.detach().cpu().numpy()
+                raw_np_state[k] = v.detach().cpu().numpy()
             elif isinstance(v, np.ndarray):
-                np_state[k] = v
+                raw_np_state[k] = v
             else:
                 # 跳過非張量權重
                 continue
         except Exception as e:
             print(f"⚠️  轉換權重失敗 {k}: {e}")
+
+    # Normalize keys to the naming expected by the numpy-forwarder.
+    # Stable-Baselines3 stores policy params under 'policy.' prefix and
+    # custom feature extractors under 'policy.features_extractor.'; other
+    # checkpoints may use 'module.' or 'model.' prefixes. Strip those so
+    # keys like 'policy.features_extractor.stem.0.weight' -> 'stem.0.weight'.
+    def _normalize_key(key: str) -> str:
+        # Order matters: longer prefixes first
+        prefixes = [
+            'policy.features_extractor.',
+            'policy.actor.features_extractor.',
+            'actor.features_extractor.',
+            'features_extractor.',
+            'policy.',
+            'actor.',
+            'module.',
+            'model.',
+        ]
+        for p in prefixes:
+            if key.startswith(p):
+                return key[len(p):]
+        # If key contains 'policy.' in the middle (rare), remove the first occurrence
+        if '.policy.' in key:
+            return key.replace('.policy.', '.', 1)
+        return key
+
+    np_state = {}
+    for k, v in raw_np_state.items():
+        nk = _normalize_key(k)
+        # Also handle double-prefix like 'policy.policy.' -> collapse
+        if nk.startswith('policy.'):
+            nk = nk[len('policy.'):]
+        # Keep unique keys; if collision occurs, prefer the normalized one already set
+        if nk in np_state:
+            # prefer keeping existing; but if shapes match and names differ, keep first
+            continue
+        np_state[nk] = v
 
     out_npz = "model_weights.npz"
     np.savez_compressed(out_npz, **np_state)

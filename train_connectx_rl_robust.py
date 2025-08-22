@@ -18,6 +18,8 @@ import argparse
 import traceback
 import multiprocessing as mp  # NEW: multiprocessing for parallel rollouts
 import ray, numpy as np, torch, time, random
+from copy import deepcopy  # NEW: for KL anchor
+from c4solver_wrapper import get_c4solver  # NEW: C++ solver integration
 
 try:
     import yaml
@@ -179,123 +181,35 @@ def random_opponent_strategy(board_flat, mark, valid_actions, agent):
     return random.choice(valid_actions)
 
 def minimax_opponent_strategy(board_flat, mark, valid_actions, agent, depth=3):
-    """Minimax opponent implementation."""
-    def score_window(window, mark):
-        opp = 3 - mark
-        cnt_self = window.count(mark)
-        cnt_opp = window.count(opp)
-        cnt_empty = window.count(0)
-        if cnt_self > 0 and cnt_opp > 0:
-            return 0
-        score = 0
-        if cnt_self == 4:
-            score += 10000
-        elif cnt_self == 3 and cnt_empty == 1:
-            score += 100
-        elif cnt_self == 2 and cnt_empty == 2:
-            score += 10
-        if cnt_opp == 3 and cnt_empty == 1:
-            score -= 120
-        return score
+    """Stronger opponent using the external C++ Connect4 solver.
 
-    def evaluate_board(board_flat, mark):
-        grid = flat_to_2d(board_flat)
-        score = 0
-        # center preference
-        center_col = [grid[r][3] for r in range(6)]
-        score += center_col.count(mark) * 3
-        # Horizontal
-        for r in range(6):
-            row = grid[r]
-            for c in range(4):
-                window = row[c:c+4]
-                score += score_window(window, mark)
-        # Vertical
-        for c in range(7):
-            col = [grid[r][c] for r in range(6)]
-            for r in range(3):
-                window = col[r:r+4]
-                score += score_window(window, mark)
-        # Diagonals
-        for r in range(3):
-            for c in range(4):
-                window = [grid[r+i][c+i] for i in range(4)]
-                score += score_window(window, mark)
-        for r in range(3, 6):
-            for c in range(4):
-                window = [grid[r-i][c+i] for i in range(4)]
-                score += score_window(window, mark)
-        return score
-
-    def has_winner(board_flat, mark):
-        grid = flat_to_2d(board_flat)
-        for r in range(6):
-            for c in range(7):
-                if grid[r][c] != mark:
-                    continue
-                if is_win_from(grid, r, c, mark):
-                    return True
-        return False
-
-    def minimax(board_flat, depth, alpha, beta, current_mark, maximizing_mark):
-        valid_moves = agent.get_valid_actions(board_flat)
-        if depth == 0 or not valid_moves:
-            return evaluate_board(board_flat, maximizing_mark), None
-        
-        best_move = None
-        if current_mark == maximizing_mark:
-            value = -float('inf')
-            for c in valid_moves:
-                nb = apply_move(board_flat, c, current_mark)
-                if nb is None:
-                    continue
-                if has_winner(nb, current_mark):
-                    return 1e6 - (5 - depth), c
-                child_val, _ = minimax(nb, depth-1, alpha, beta, 3-current_mark, maximizing_mark)
-                if child_val > value:
-                    value, best_move = child_val, c
-                alpha = max(alpha, value)
-                if alpha >= beta:
-                    break
-            return value, best_move
-        else:
-            value = float('inf')
-            for c in valid_moves:
-                nb = apply_move(board_flat, c, current_mark)
-                if nb is None:
-                    continue
-                if has_winner(nb, current_mark):
-                    return -1e6 + (5 - depth), c
-                child_val, _ = minimax(nb, depth-1, alpha, beta, 3-current_mark, maximizing_mark)
-                if child_val < value:
-                    value, best_move = child_val, c
-                beta = min(beta, value)
-                if alpha >= beta:
-                    break
-            return value, best_move
-
-    # Check tactical moves first
+    Falls back to tactical-random if the solver is unavailable or returns an invalid move.
+    """
+    # Quick tactical short-circuit
     c = if_i_can_win(board_flat, mark, agent)
     if c is not None:
         return c
     c = if_i_will_lose(board_flat, mark, agent)
     if c is not None:
         return c
-    
-    # Use minimax
+
+    try:
+        solver = get_c4solver()
+        if solver is not None and valid_actions:
+            best_move, _conf = solver.get_best_move(board_flat, valid_actions)
+            if best_move in valid_actions:
+                return int(best_move)
+    except Exception:
+        pass
+
+    # Fallback: prefer safe moves, then center preference, then random
     safe = safe_moves(board_flat, mark, valid_actions, agent)
-    moves = safe if safe else valid_actions
-    best_score = -float('inf')
-    best_move = random.choice(moves)
-    
-    for a in moves:
-        nb = apply_move(board_flat, a, mark)
-        if nb is None:
-            continue
-        score, _ = minimax(nb, depth-1, -float('inf'), float('inf'), 3-mark, mark)
-        if score > best_score:
-            best_score, best_move = score, a
-    return best_move
+    if safe:
+        return int(random.choice(safe))
+    for col in [3, 4, 2, 5, 1, 6, 0]:
+        if col in valid_actions:
+            return int(col)
+    return int(valid_actions[0] if valid_actions else 0)
 # ===== 漸進式對手策略 (從弱到強) =====
 
 def pure_random_opponent_strategy(board_flat, mark, valid_actions, agent):
@@ -1054,6 +968,18 @@ class PPOAgent:
         pretrained_path = config.get('pretrained_model_path')
         if pretrained_path:
             self.load_pretrained_model(pretrained_path)
+        # KL regularizer anchor/net + hyperparams
+        kl_cfg = {}
+        try:
+            if isinstance(config, dict):
+                kl_cfg = config.get('kl_regularizer', config.get('kl', {})) or {}
+        except Exception:
+            kl_cfg = {}
+        self.kl_coef = float(kl_cfg.get('coef', 0.02))  # small anchor to imitation
+        self.kl_decay = float(kl_cfg.get('decay', 0.999))
+        self.kl_min_coef = float(kl_cfg.get('min_coef', 0.001))
+        self.kl_mask_invalid = bool(kl_cfg.get('mask_invalid', True))
+        self.anchor_net: nn.Module | None = None
 
         # 優化器
         self.optimizer = optim.Adam(
@@ -1094,6 +1020,67 @@ class PPOAgent:
         # Ensure numpy alias
         self._np = np
 
+    # --- KL anchor helpers ---
+    def set_anchor_from_current(self):
+        """Freeze a copy of current policy as KL anchor (CPU, eval)."""
+        try:
+            self.anchor_net = deepcopy(self.policy_net).to('cpu')
+            for p in self.anchor_net.parameters():
+                p.requires_grad_(False)
+            self.anchor_net.eval()
+            try:
+                logger.info("🔒 KL anchor set from current policy")
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                logger.warning(f"Failed to set KL anchor: {e}")
+            except Exception:
+                pass
+
+    def _compute_valid_mask_from_states(self, states_tensor: torch.Tensor) -> torch.Tensor:
+        """Derive legal-action mask [B,7] from encoded states (3x6x7 planes)."""
+        try:
+            B = states_tensor.size(0)
+            planes = states_tensor.view(B, 3, 6, 7)
+            occ = (planes[:, 0] + planes[:, 1])  # (B,6,7)
+            top_occ = occ[:, 0, :]  # (B,7), 1 if occupied
+            mask = (top_occ <= 0).to(states_tensor.dtype)
+            return mask
+        except Exception:
+            # Fallback: all legal
+            return torch.ones((states_tensor.size(0), 7), dtype=states_tensor.dtype, device=states_tensor.device)
+
+    def _kl_loss(self, curr_probs: torch.Tensor, states_tensor: torch.Tensor) -> torch.Tensor:
+        """Compute mean KL(anchor || current) over batch, optionally masking invalid cols.
+        curr_probs: [B,7] softmax outputs from current policy.
+        """
+        if self.anchor_net is None or self.kl_coef <= 0:
+            return torch.tensor(0.0, device=states_tensor.device, dtype=states_tensor.dtype)
+        with torch.no_grad():
+            # Anchor on CPU; run in no-grad and move to device for math
+            anchor_probs, _ = self.anchor_net(states_tensor.detach().to('cpu'))
+            anchor_probs = anchor_probs.to(states_tensor.device)
+        p = anchor_probs.clamp_min(1e-8)
+        q = curr_probs.clamp_min(1e-8)
+        if self.kl_mask_invalid:
+            mask = self._compute_valid_mask_from_states(states_tensor)  # [B,7]
+            # re-normalize on masked support
+            p = p * mask
+            q = q * mask
+            # avoid degenerate all-zero rows -> uniform over all actions
+            p = p / (p.sum(dim=1, keepdim=True) + 1e-8)
+            q = q / (q.sum(dim=1, keepdim=True) + 1e-8)
+        kl = (p * (p.add(1e-8).log() - q.add(1e-8).log())).sum(dim=1)
+        return kl.mean()
+
+    def _decay_kl_coef(self):
+        try:
+            if self.kl_coef > 0:
+                self.kl_coef = max(self.kl_min_coef, self.kl_coef * self.kl_decay)
+        except Exception:
+            pass
+
     def load_pretrained_model(self, model_path: str):
         """
         載入預訓練的模仿學習模型
@@ -1124,6 +1111,8 @@ class PPOAgent:
             self.policy_net.load_state_dict(model_state)
             
             logger.info("✅ 成功載入預訓練模型！模型已準備好進行RL訓練")
+            # Set KL anchor to this imitation policy
+            self.set_anchor_from_current()
             return True
             
         except Exception as e:
@@ -1425,6 +1414,9 @@ class PPOAgent:
 
             # 熵損失（鼓勵探索）
             entropy = -(new_probs * torch.log(new_probs + 1e-8)).sum(dim=1)
+
+            # KL(anchor || current) regularization (masked by legality)
+            kl_term = self._kl_loss(new_probs, states_tensor)
             
             # 應用重要性加權（PER的修正）
             weighted_policy_loss = (policy_loss * is_weights).mean()
@@ -1433,6 +1425,8 @@ class PPOAgent:
 
             # 總損失
             loss = weighted_policy_loss + self.value_coef * weighted_value_loss - self.entropy_coef * weighted_entropy
+            if self.kl_coef > 0:
+                loss = loss + float(self.kl_coef) * kl_term
             
             # 反向傳播
             self.optimizer.zero_grad()
@@ -1447,10 +1441,12 @@ class PPOAgent:
             entropy_sum += weighted_entropy.item()
 
         # 7) 計算TD error絕對值作為新的priority
+        # optional KL decay per update
+        self._decay_kl_coef()
         with torch.no_grad():
             _, current_values = self.policy_net(states_tensor)
             current_values = current_values.squeeze().cpu().numpy()
-            
+
             # 計算TD error: |r + γV(s') - V(s)|
             next_values = np.zeros_like(current_values)
             for i in range(batch_size):
@@ -1458,7 +1454,7 @@ class PPOAgent:
                     next_values[i] = current_values[i + 1] if i + 1 < len(current_values) else 0
                 else:
                     next_values[i] = 0
-            
+
             td_errors = rewards + self.gamma * next_values * (1 - dones.astype(float)) - current_values
             td_errors_abs = np.abs(td_errors) + 1e-3
 
@@ -1466,7 +1462,7 @@ class PPOAgent:
         self.update_step += 1
         avg_entropy = entropy_sum / max(1, self.k_epochs)
         self.entropy_window.append(avg_entropy)
-        
+
         if len(self.entropy_window) >= max(5, self.entropy_window.maxlen or 5):
             try:
                 mean_ent = float(np.mean(self.entropy_window))
@@ -1590,7 +1586,11 @@ class PPOAgent:
             entropy_sum += float(entropy.item())
 
             # 總損失
+            # KL(anchor || current) regularization
+            kl_term = self._kl_loss(new_probs, states_tensor)
             loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+            if self.kl_coef > 0:
+                loss = loss + float(self.kl_coef) * kl_term
             total_loss += loss.item()
 
             # 反向傳播
@@ -1620,6 +1620,8 @@ class PPOAgent:
                     self.partial_reset('res_blocks_and_head')
             except Exception:
                 pass
+        # optional KL decay per update
+        self._decay_kl_coef()
         return {
             'policy_loss': policy_loss.item(),
             'value_loss': value_loss.item(),
@@ -1833,6 +1835,17 @@ class ConnectXTrainer:
 
         # 初始化智能體
         self.agent = PPOAgent(self.config['agent'])
+        # 如果全域配置中提供了預訓練模型，載入並設置 KL 錨點
+        try:
+            pre_cfg = self.config.get('pretrained', {}) if isinstance(self.config, dict) else {}
+            if bool(pre_cfg.get('use_pretrained', False)):
+                pth = pre_cfg.get('pretrained_model_path') or pre_cfg.get('path')
+                if isinstance(pth, str) and pth:
+                    ok = self.agent.load_pretrained_model(pth)
+                    if ok and hasattr(self.agent, 'set_anchor_from_current'):
+                        self.agent.set_anchor_from_current()
+        except Exception:
+            pass
 
         # 訓練統計
         self.episode_rewards = []
@@ -2454,7 +2467,7 @@ class ConnectXTrainer:
             next_viz_at = None
 
         logger.info(f"🚀 Ray Actor 平行訓練啟動：actors={num_actors}, episodes_per_task={episodes_per_task}")
-
+        best_win_rate = 0.0
         try:
             while episodes_done_total < max_episodes:
                 # 等待任一 actor 完成
@@ -2573,15 +2586,16 @@ class ConnectXTrainer:
                         self.agent.scheduler.step(score)
                     except Exception:
                         pass
-
+                    if score > best_win_rate:
+                        best_win_rate = score
                     # Difficulty label from moving win-rate
-                    if current_win_rate < 0.2:
+                    if best_win_rate < 0.2:
                         difficulty = "初級 (純隨機+只會贏)"
-                    elif current_win_rate < 0.4:
+                    elif best_win_rate < 0.4:
                         difficulty = "初階 (加入防守)"
-                    elif current_win_rate < 0.55:
+                    elif best_win_rate < 0.55:
                         difficulty = "中階 (偏好中央+弱戰術)"
-                    elif current_win_rate < 0.7:
+                    elif best_win_rate < 0.7:
                         difficulty = "進階 (容易犯錯)"
                     else:
                         difficulty = "高階 (完整戰術)"
@@ -2962,6 +2976,12 @@ class ConnectXTrainer:
             if unexpected:
                 logger.warning(f"載入時未使用鍵(前若干): {unexpected[:5]}")
             logger.info("✅ 模型權重載入成功")
+            # Refresh KL anchor to loaded policy
+            try:
+                if hasattr(self.agent, 'set_anchor_from_current'):
+                    self.agent.set_anchor_from_current()
+            except Exception:
+                pass
 
             # 優化器
             if isinstance(checkpoint, dict) and 'optimizer_state_dict' in checkpoint:
@@ -3050,7 +3070,7 @@ class ConnectXTrainer:
 
         steps_since_update = 0
         recent_results = []  # 追蹤最近的對戰結果
-        
+        best_win_rate = 0.0
         try:
             while episodes_done_total < max_episodes:
                 # 輕量輪詢完成的任務
@@ -3098,8 +3118,8 @@ class ConnectXTrainer:
                                 reward = tr.get('reward', 0.0)
                                 
                                 # 如果需要額外的危險行為懲罰，可以添加
-                                if tr.get('is_dangerous', False):
-                                    reward += -10.0 * danger_scale
+                                # 移除額外的危險步懲罰，避免與 shaping 重複（shaping 已包含 blunder 懲罰）
+                                # 若需要更強懲罰，請於 calculate_custom_reward_global 中調整。
                                     
                                 ep_reward_sum += reward
                                 done = (idx == len(transitions) - 1)
@@ -3117,7 +3137,8 @@ class ConnectXTrainer:
                                 steps_since_update = 0
 
                         episodes_done_total += 1
-
+                        if best_win_rate < current_win_rate:
+                            best_win_rate = current_win_rate
                         # 週期性評估
                         if eval_frequency > 0 and episodes_done_total % eval_frequency == 0:
                             metrics = self.evaluate_comprehensive(games=eval_games)
@@ -3130,13 +3151,13 @@ class ConnectXTrainer:
                                 pass
                             
                             # 顯示當前對手難度等級
-                            if current_win_rate < 0.2:
+                            if best_win_rate < 0.2:
                                 difficulty = "初級 (純隨機+只會贏)"
-                            elif current_win_rate < 0.4:
+                            elif best_win_rate < 0.4:
                                 difficulty = "初階 (加入防守)"
-                            elif current_win_rate < 0.55:
+                            elif best_win_rate < 0.55:
                                 difficulty = "中階 (偏好中央+弱戰術)"
-                            elif current_win_rate < 0.7:
+                            elif best_win_rate < 0.7:
                                 difficulty = "進階 (容易犯錯)"
                             else:
                                 difficulty = "高階 (完整戰術)"
@@ -3147,7 +3168,7 @@ class ConnectXTrainer:
                             )
                             
                             try:
-                                if self._detect_convergence_stagnation(episodes_done_total, score):
+                                if episodes_done_total > 200 and self._detect_convergence_stagnation(episodes_done_total, score):
                                     self._handle_convergence_stagnation(episodes_done_total)
                             except Exception:
                                 pass
@@ -3218,7 +3239,7 @@ class ConnectXTrainer:
         return self.agent
 
 
-    def _record_game_frames(self, opponent: str = 'tactical', max_moves: int = 50):
+    def _record_game_frames(self, opponent: str = 'minmax', max_moves: int = 50):
         """遊玩一局並記錄每步的棋盤影格（6x7數組）。"""
         frames = []
         try:
@@ -3244,13 +3265,13 @@ class ConnectXTrainer:
                             # 我方用策略 + 安全檢查
                             a = self._choose_policy_with_tactics(board, mark, valid, training=False)
                         else:
-                            if opponent == 'tactical':
-                                a = self._tactical_random_opening_agent(board, mark, valid)
-                            elif opponent == 'minimax':
-                                a = self._choose_minimax_move(board, mark, max_depth=int(self.config.get('evaluation', {}).get('minimax_depth', 3)))
-                            else:
+                            # if opponent == 'tactical':
+                            #     a = self._tactical_random_opening_agent(board, mark, valid)
+                            # elif opponent == 'minimax':
+                            a = self._choose_minimax_move(board, mark, max_depth=int(self.config.get('evaluation', {}).get('minimax_depth', 3)))
+                            # else:
                                 # random family uses the same unified logic
-                                a = self._tactical_random_opening_agent(board, mark, valid)
+                                # a = self._tactical_random_opening_agent(board, mark, valid)
                         actions.append(int(a))
                     try:
                         env.step(actions)
@@ -3317,7 +3338,7 @@ class ConnectXTrainer:
         # 新增圖例說明顏色: 紅=Agent(P1), 金=Opponent(P2)
         handles = [
             Patch(color='red', label='Agent (P1)'),
-            Patch(color='gold', label='Opponent (P2)')
+            Patch(color='gold', label='minmax (P2)')
         ]
         ax.legend(handles=handles, loc='upper right', framealpha=0.9)
 
@@ -3498,6 +3519,7 @@ def main():
                 # 3) 退回原本依名稱/mtime 的最新者
                 ckpt_to_load = choose_latest_checkpoint_by_name(files)
 
+    ckpt_to_load = 'perfect_imitation_model.pt'
     logger.info(f"ckpt_to_load: {ckpt_to_load}")
     send_telegram("使用: "+str(ckpt_to_load)+" model來繼續")
     if ckpt_to_load:
@@ -3506,7 +3528,6 @@ def main():
             logger.warning(f"無法載入檢查點: {ckpt_to_load}，將以隨機初始化開始。")
     else:
         logger.info("未找到可用檢查點，將以隨機初始化開始訓練。")
-
     # --- train ---
     start_ts = datetime.now()
     err = None

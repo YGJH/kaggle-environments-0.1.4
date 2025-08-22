@@ -30,4 +30,9 @@ dependencies = [
     "psutil>=7.0.0",
     "opencv-python>=4.11.0.86",
     "ray[default]>=2.48.0",
+    "stable-baselines3>=2.7.0",
+    "optuna>=3.5.0",
+    "path>=17.1.1",
+    "rich>=14.1.0",
+    "nuitka>=2.7.12",
 ]

@@ -19,7 +19,7 @@ from kaggle_environments import make, utils
 import time
 
 # 導入AI模型
-submission = utils.read_file("submission.py")
+submission = utils.read_file("submission_vMega.py")
 agent = utils.get_last_callable(submission)
 
 class AIThread(QThread):
@@ -42,7 +42,13 @@ class AIThread(QThread):
                 'board': self.board.flatten().tolist(),
                 'mark': 2
             }
-            config = {'rows': self.rows, 'columns': self.cols, 'inarow': 4}
+            # 使用具有屬性的config物件，與Kaggle agent慣例一致
+            class Config:
+                def __init__(self, rows, columns, inarow):
+                    self.rows = rows
+                    self.columns = columns
+                    self.inarow = inarow
+            config = Config(self.rows, self.cols, 4)
             
             move = agent(obs, config)
             

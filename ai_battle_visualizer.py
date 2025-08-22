@@ -226,23 +226,14 @@ class ConnectXVisualizer:
             return False
 
 def load_agent_from_file(file_path):
-    """從文件載入agent函數，包含錯誤處理"""
+    """從 .py 檔載入 Kaggle agent：使用 kaggle_environments.utils 解析出最後一個可呼叫物件。
+    這樣不依賴 submission.py 內部實作細節，可避免 'output.weight' 類錯誤。
+    """
+    from kaggle_environments import utils as kaggle_utils
     try:
-        spec = importlib.util.spec_from_file_location("agent_module", file_path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module.agent
+        code = kaggle_utils.read_file(file_path)
+        return kaggle_utils.get_last_callable(code)
     except Exception as e:
-        # print(f"⚠️  載入 {file_path} 失敗: {e}")
-        # print(f"🔄 嘗試使用備用AI...")
-        
-        # # 如果是submission.py失敗，使用簡單規則AI
-        # if "submission.py" in file_path:
-        #     return create_simple_rule_agent()
-        # # 如果是submission2.py失敗，使用固定的神經網路AI
-        # elif "submission2.py" in file_path:
-        #     return create_fixed_neural_agent()
-        # else:
         raise e
 
 def create_simple_rule_agent():
@@ -587,7 +578,7 @@ def main():
     
     # 設置AI文件路徑
     agent1_file = "submission.py"      # 第一個AI檔案（標籤用）
-    agent2_file = "submission2.py"       # 第二個AI檔案（標籤用）
+    agent2_file = "submission_vMega.py"       # 第二個AI檔案（標籤用）
     
     # 檢查文件是否存在
     if not os.path.exists(agent1_file):
