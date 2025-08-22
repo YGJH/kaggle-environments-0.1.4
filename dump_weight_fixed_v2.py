@@ -646,18 +646,17 @@ if __name__ == "__main__":
     # 選最新的 checkpoint（依檔名帶時間戳或 mtime）或由參數指定
     import argparse
 
-    parser = argparse.ArgumentParser(description="Dump a ConnectX checkpoint to submission.py with embedded weights")
-    parser.add_argument(
-        "-m", "--model", type=str, default=None,
-        help="Path to a specific checkpoint .pt to dump (absolute or relative). If relative and not found, 'checkpoints/<name>' will be tried."
-    )
+    parser = argparse.ArgumentParser(description="Convert PyTorch model checkpoints to submission.py files.")
+    parser.add_argument("--input", type=str, default="None", help="Input checkpoint file pattern.")
+    parser.add_argument("--output", type=str, default="sub/", help="Output directory for submission files.")
+
     args = parser.parse_args()
 
     ckpt_files = glob.glob(os.path.join("checkpoints", "*.pt"))
 
     selected = None
-    if args.model:
-        candidate = args.model
+    if args.input:
+        candidate = args.input
         # If provided is not absolute, try as-is then under checkpoints/
         tried = []
         if os.path.isabs(candidate):

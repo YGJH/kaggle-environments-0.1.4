@@ -51,6 +51,7 @@ def dump_all_checkpoints(ckpt_dir: str = CHECKPOINT_DIR, sub_dir: str = SUB_DIR)
         try:
             # If this checkpoint name starts with 'battle' prefer the specialized dumper which
             # understands the raw state_dict format produced by `online_battle_trainer.py`.
+            cmd = ['uv', 'run', 'dump_weight_fixed_v2.py', '--input', pt_path, '--output', sub_path]
             if base_name.startswith("battle") and battle_dumper is not None:
                 try:
                     produced = battle_dumper.dump_checkpoint_to_submission(Path(pt_path), dry_run=False)
@@ -60,7 +61,23 @@ def dump_all_checkpoints(ckpt_dir: str = CHECKPOINT_DIR, sub_dir: str = SUB_DIR)
                         print(f"  ✅ {os.path.basename(pt_path)} -> {os.path.basename(produced)} (via dump_battle_checkpoints)")
                         continue
                 except Exception as e:
-                    print(f"  ⚠️  battle dumper failed for {base_name}, falling back: {e}")
+                    try:
+                        subprocess.run(cmd, check=True, shell=True)
+                    except Exception as e:
+                        print(f"  ⚠️  battle dumper failed for {base_name}, falling back: {e}")
+            else:
+                try:
+                    subprocess.run(cmd, check=True, shell=True)
+                except Exception as e:
+                    try:
+                        produced = battle_dumper.dump_checkpoint_to_submission(Path(pt_path), dry_run=False)
+                        # produced is a Path to the generated submission
+                        if produced is not None and os.path.exists(str(produced)):
+                            converted_pairs.append((pt_path, str(produced)))
+                            print(f"  ✅ {os.path.basename(pt_path)} -> {os.path.basename(produced)} (via dump_battle_checkpoints)")
+                            continue
+                    except Exception as e:
+                        print(f"  ⚠️  fallback dumper failed for {base_name}: {e}")
 
             # Load checkpoint and generate submission
             checkpoint = torch.load(pt_path, map_location='cpu')

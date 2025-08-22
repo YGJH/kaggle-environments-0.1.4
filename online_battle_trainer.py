@@ -688,23 +688,48 @@ def main():
     )
     
     # Find failed opponents
+    # Prefer explicit failed_log parsing if provided
     if args.failed_log and os.path.exists(args.failed_log):
         failed_list = load_failed_opponents_from_log(args.failed_log)
         failed_opponents = [(ckpt, os.path.join(args.sub_dir, f"{os.path.splitext(os.path.basename(ckpt))[0]}.py")) 
                            for ckpt, _ in failed_list]
     else:
-        # Run battle evaluation first to identify failed opponents
-        logger.info("Running initial battle evaluation...")
-        os.system(f"python batch_dump_and_battle.py --main_ckpt {os.path.basename(args.main_ckpt)} --winrate {args.winrate_threshold}")
-        
-        # Manual fallback - train against some known challenging opponents
-        potential_opponents = [os.path.basename(f) for f in glob.glob(os.path.join(args.ckpt_dir, "*.pt"))]
-        failed_opponents = []
-        for opp in potential_opponents:
-            ckpt_path = os.path.join(args.ckpt_dir, opp)
-            sub_path = os.path.join(args.sub_dir, f"{os.path.splitext(opp)[0]}.py")
-            if os.path.exists(ckpt_path) and os.path.exists(sub_path):
-                failed_opponents.append((ckpt_path, sub_path))
+        # Ensure submission dir exists
+        os.makedirs(args.sub_dir, exist_ok=True)
+
+        # First: attempt to convert all checkpoints to runnable submission agents
+        try:
+            logger.info("Converting checkpoints to submission agents (dump_all_checkpoints)...")
+            converted = dump_all_checkpoints(args.ckpt_dir, args.sub_dir)
+            # converted is list of (pt_path, sub_path)
+            failed_opponents = []
+            for pt_path, sub_path in converted:
+                # include only valid pairs
+                if os.path.exists(pt_path) and os.path.exists(sub_path):
+                    failed_opponents.append((pt_path, sub_path))
+
+            if not failed_opponents:
+                # If nothing converted, fall back to running batch_dump_and_battle external script
+                logger.info("No converted submissions found, running batch_dump_and_battle.py as fallback to generate subs...")
+                os.system(f"uv run batch_dump_and_battle.py --main_ckpt {os.path.basename(args.main_ckpt)} --winrate {args.winrate_threshold}")
+                # After fallback, try to collect submissions from sub_dir
+                potential_opponents = [os.path.basename(f) for f in glob.glob(os.path.join(args.ckpt_dir, "*.pt"))]
+                for opp in potential_opponents:
+                    ckpt_path = os.path.join(args.ckpt_dir, opp)
+                    sub_path = os.path.join(args.sub_dir, f"{os.path.splitext(opp)[0]}.py")
+                    if os.path.exists(ckpt_path) and os.path.exists(sub_path):
+                        failed_opponents.append((ckpt_path, sub_path))
+
+        except Exception as e:
+            logger.warning(f"Failed to dump checkpoints to submissions: {e}")
+            # Fallback: attempt to locate existing submissions under sub_dir
+            failed_opponents = []
+            potential_opponents = [os.path.basename(f) for f in glob.glob(os.path.join(args.ckpt_dir, "*.pt"))]
+            for opp in potential_opponents:
+                ckpt_path = os.path.join(args.ckpt_dir, opp)
+                sub_path = os.path.join(args.sub_dir, f"{os.path.splitext(opp)[0]}.py")
+                if os.path.exists(ckpt_path) and os.path.exists(sub_path):
+                    failed_opponents.append((ckpt_path, sub_path))
 
         # Also include submission_vMega.py if present (visualizer expects it)
         vmega_paths = [
