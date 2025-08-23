@@ -451,7 +451,13 @@ class BattleEvalCallback(BaseCallback):
             # Don't interrupt training; return True to continue
         finally:
             # No temp files to clean when using live agent
-            pass
+            try:
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
 
         return True
 
@@ -489,14 +495,14 @@ def train_against_opponents(main_ckpt: str, failed_opponents: List[Tuple[str, st
     # Load opponent agents
     opponent_agents = []
     opponent_names = []
-    for ckpt_path, sub_path in failed_opponents:
+    for sub_path in failed_opponents:
         try:
-            agent = load_agent_from_submission(sub_path)
+            agent = load_agent_from_submission(os.path.join('sub', sub_path))
             opponent_agents.append(agent)
-            opponent_names.append(os.path.basename(ckpt_path))
-            logger.info(f"Loaded opponent: {os.path.basename(ckpt_path)}")
+            opponent_names.append(os.path.basename(os.path.join('sub', sub_path)))
+            logger.info(f"Loaded opponent: {os.path.basename(sub_path)}")
         except Exception as e:
-            logger.warning(f"Failed to load opponent {ckpt_path}: {e}")
+            logger.warning(f"Failed to load opponent {sub_path}: {e}")
 
     # Built-in tactical/random opening agent
     def _tactical_random_opening_agent(obs, config):
@@ -597,13 +603,13 @@ def train_against_opponents(main_ckpt: str, failed_opponents: List[Tuple[str, st
         env = DummyVecEnv([make_env])
     
     # Load main agent policy for initialization
-    device = torch.device("cpu")
+    device = torch.device("cuda")
     
     # Initialize PPO with loaded weights
     # Extremely large Transformer-based policy/value networks.
     # NOTE: This configuration is memory intensive (hundreds of millions of params).
     # Adjust n_layers or d_model if you encounter OOM.
-    big_layers = [512] * 24  # 32-layer 2000-d hidden for both policy (pi) and value (vf) MLP heads
+    big_layers = [128] * 24  # 32-layer 2000-d hidden for both policy (pi) and value (vf) MLP heads
     model = PPO(
         "MlpPolicy",
         env,
@@ -687,7 +693,7 @@ def main():
     parser.add_argument("--timesteps", type=int, default=50000)
     parser.add_argument("--max_rounds", type=int, default=10)
     parser.add_argument("--winrate_threshold", type=float, default=0.8)
-    parser.add_argument("--num_envs", type=int, default=1, help="Number of parallel envs for SubprocVecEnv; fallback to DummyVecEnv on pickling errors")
+    parser.add_argument("--num_envs", type=int, default=6, help="Number of parallel envs for SubprocVecEnv; fallback to DummyVecEnv on pickling errors")
     args = parser.parse_args()
     
     config = TrainingConfig(
@@ -697,67 +703,14 @@ def main():
         num_envs=args.num_envs if hasattr(args, 'num_envs') else 1
     )
     
-    # Find failed opponents
-    # Prefer explicit failed_log parsing if provided
-    if args.failed_log and os.path.exists(args.failed_log):
-        failed_list = load_failed_opponents_from_log(args.failed_log)
-        failed_opponents = [(ckpt, os.path.join(args.sub_dir, f"{os.path.splitext(os.path.basename(ckpt))[0]}.py")) 
-                           for ckpt, _ in failed_list]
-    else:
-        # Ensure submission dir exists
-        os.makedirs(args.sub_dir, exist_ok=True)
-
-        # First: attempt to convert all checkpoints to runnable submission agents
-        try:
-            logger.info("Converting checkpoints to submission agents (dump_all_checkpoints)...")
-            converted = dump_all_checkpoints(args.ckpt_dir, args.sub_dir)
-            # converted is list of (pt_path, sub_path)
-            failed_opponents = []
-            for pt_path, sub_path in converted:
-                # include only valid pairs
-                if os.path.exists(pt_path) and os.path.exists(sub_path):
-                    failed_opponents.append((pt_path, sub_path))
-
-            if not failed_opponents:
-                # If nothing converted, fall back to running batch_dump_and_battle external script
-                logger.info("No converted submissions found, running batch_dump_and_battle.py as fallback to generate subs...")
-                os.system(f"uv run batch_dump_and_battle.py --main_ckpt {os.path.basename(args.main_ckpt)} --winrate {args.winrate_threshold}")
-                # After fallback, try to collect submissions from sub_dir
-                potential_opponents = [os.path.basename(f) for f in glob.glob(os.path.join(args.ckpt_dir, "*.pt"))]
-                for opp in potential_opponents:
-                    ckpt_path = os.path.join(args.ckpt_dir, opp)
-                    sub_path = os.path.join(args.sub_dir, f"{os.path.splitext(opp)[0]}.py")
-                    if os.path.exists(ckpt_path) and os.path.exists(sub_path):
-                        failed_opponents.append((ckpt_path, sub_path))
-
-        except Exception as e:
-            logger.warning(f"Failed to dump checkpoints to submissions: {e}")
-            # Fallback: attempt to locate existing submissions under sub_dir
-            failed_opponents = []
-            potential_opponents = [os.path.basename(f) for f in glob.glob(os.path.join(args.ckpt_dir, "*.pt"))]
-            for opp in potential_opponents:
-                ckpt_path = os.path.join(args.ckpt_dir, opp)
-                sub_path = os.path.join(args.sub_dir, f"{os.path.splitext(opp)[0]}.py")
-                if os.path.exists(ckpt_path) and os.path.exists(sub_path):
-                    failed_opponents.append((ckpt_path, sub_path))
-
-        # Also include submission_vMega.py if present (visualizer expects it)
-        vmega_paths = [
-            os.path.join(os.getcwd(), 'submi/main.py'),
-            # os.path.join(os.getcwd(), 'sub', 'submission_vMega.py'),
-        ]
-        for vp in vmega_paths:
-            if os.path.exists(vp):
-                logger.info(f"Including special opponent: {vp}")
-                # Use a synthetic checkpoint path name for logging consistency
-                failed_opponents.append((os.path.basename(vp), vp))
+    failed_opponents = [model_file for model_file in os.listdir(os.path.join('sub'))]
     
     if not failed_opponents:
         logger.info("No failed opponents found - main agent may already be strong enough!")
         return
     
     logger.info(f"Training against {len(failed_opponents)} failed opponents...")
-    
+    logger.info(f'failed_oppoents {failed_opponents}')   
     current_main = args.main_ckpt
     for round_num in range(config.max_training_rounds):
         logger.info(f"\n=== Training Round {round_num + 1}/{config.max_training_rounds} ===")
